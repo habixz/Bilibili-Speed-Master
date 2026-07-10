@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站倍速助手
 // @namespace    /DBI/bilibili-speed-assistant
-// @version      1.0.0
-// @description  合并自定义倍速(支持两栏显示倍速菜单); 按视频记忆倍速(兼容 B 站站内跳转)
+// @version      1.1.1
+// @description  合并自定义倍速(支持两栏显示倍速菜单); 按视频记忆倍速(兼容 B 站站内跳转); 新增增减倍速快捷键
 // @author       habixz
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/watchlater*
@@ -26,15 +26,22 @@
      */
     const STORAGE_PREFIX = 'bilibili_speed_assistant_rate';
     const SETTINGS_KEY_RATES = 'speedAssistant_customRatesAndShortcuts';
+    const SETTINGS_KEY_RATE_ADJUST_SHORTCUTS = 'speedAssistant_rateAdjustShortcuts';
     const SETTINGS_KEY_TWO_COLS = 'speedAssistant_twoCols';
     const SETTINGS_KEY_CONFIG_VERSION = 'speedAssistant_configVersion';
     const EXPIRE_MS = 24 * 60 * 60 * 1000;
     const LAYOUT_STYLE_ID = 'bilibili-speed-assistant-layout-style';
     const CUSTOM_ITEM_MARK = 'bilibiliSpeedAssistantCustom';
     const DEFAULT_PLAYBACK_RATE = 1;
+    const MIN_PLAYBACK_RATE = 0.1;
+    const MAX_PLAYBACK_RATE = 16;
+    const PLAYBACK_RATE_ADJUST_STEP = 0.1;
     const BOOTSTRAP_RETRY_DELAY = 400;
     const BOOTSTRAP_RETRY_LIMIT = 20;
-    const CURRENT_CONFIG_VERSION = 2;
+    const PLAYBACK_RATE_APPLY_RETRY_DELAYS = [0, 120, 320, 700, 1200, 1800];
+    const CENTER_RATE_HINT_HIDE_DELAY = 650;
+    const CENTER_RATE_HINT_REMOVE_DELAY = 900;
+    const CURRENT_CONFIG_VERSION = 3;
 
     /**
      * 默认倍速和快捷键列表.
@@ -54,6 +61,15 @@
         { rate: 4, shortcut: '' },
         { rate: 5, shortcut: '' },
     ];
+
+    /**
+     * 默认的“增加/减少倍速快捷键”。
+     * 默认留空，表示由用户自己决定是否启用，以及如何分配按键。
+     */
+    const DEFAULT_RATE_ADJUST_SHORTCUTS = {
+        increase: '',
+        decrease: ''
+    };
 
     /**
      * 旧版脚本里原本就是 B 站自带的基础倍速。
@@ -113,7 +129,22 @@
         currentVideo: null,
         bootstrapTimer: null,
         resultTextSyncTimers: [],
+        playbackRateApplyTimers: [],
+        pendingPlaybackRateApply: {
+            videoElement: null,
+            targetRate: null
+        },
+        centerRateHintHost: null,
+        centerRateHintElement: null,
+        centerRateHintHideTimer: 0,
+        centerRateHintRemoveTimer: 0,
         rateConfigDialogOverlay: null,
+        rateAdjustShortcutDialogOverlay: null,
+        dialogScrollLock: null,
+        rateAdjustHoldTimer: 0,
+        rateAdjustHoldAction: '',
+        rateAdjustHoldShortcut: '',
+        rateAdjustHoldStartedAt: 0,
         restoreMark: {
             videoKey: '',
             videoElement: null
@@ -159,6 +190,9 @@
 
         return {
             customRates: normalizedRates,
+            rateAdjustShortcuts: normalizeRateAdjustShortcutConfig(
+                GM_getValue(SETTINGS_KEY_RATE_ADJUST_SHORTCUTS, DEFAULT_RATE_ADJUST_SHORTCUTS)
+            ),
             twoCols: Boolean(GM_getValue(SETTINGS_KEY_TWO_COLS, 0))
         };
     }
@@ -250,6 +284,169 @@
         }
 
         return [...orderedModifiers.filter((modifier) => modifierSet.has(modifier)), key].join('+');
+    }
+
+    /**
+     * 标准化允许“不带修饰键”的快捷键字符串。
+     * 这个版本专门给“增减倍速快捷键”使用，因此不再强制要求必须带修饰键。
+     *
+     * @param {string} shortcut
+     * @returns {string}
+     */
+    function normalizeShortcutAllowPlainKey(shortcut) {
+        if (!shortcut) {
+            return '';
+        }
+
+        const modifierAliasMap = {
+            control: 'ctrl',
+            cmd: 'meta',
+            command: 'meta',
+            option: 'alt'
+        };
+        const keyAliasMap = {
+            '↑': 'arrowup',
+            '↓': 'arrowdown',
+            '←': 'arrowleft',
+            '→': 'arrowright'
+        };
+        const orderedModifiers = ['ctrl', 'alt', 'shift', 'meta'];
+        const rawParts = String(shortcut)
+            .split('+')
+            .map((part) => part.trim().toLowerCase())
+            .filter(Boolean);
+
+        if (rawParts.length === 0) {
+            return '';
+        }
+
+        const key = keyAliasMap[rawParts[rawParts.length - 1]] || rawParts[rawParts.length - 1];
+        if (!key) {
+            return '';
+        }
+
+        const modifierSet = new Set();
+        for (let i = 0; i < rawParts.length - 1; i += 1) {
+            const rawModifier = modifierAliasMap[rawParts[i]] || rawParts[i];
+            if (!orderedModifiers.includes(rawModifier)) {
+                return '';
+            }
+            modifierSet.add(rawModifier);
+        }
+
+        return [...orderedModifiers.filter((modifier) => modifierSet.has(modifier)), key].join('+');
+    }
+
+    /**
+     * 规整“增减倍速快捷键”配置。
+     * 允许留空，留空就表示该方向暂时不启用。
+     *
+     * @param {{ increase?: string, decrease?: string } | null | undefined} rawConfig
+     * @returns {{ increase: string, decrease: string }}
+     */
+    function normalizeRateAdjustShortcutConfig(rawConfig) {
+        return {
+            increase: normalizeShortcutAllowPlainKey(rawConfig?.increase || ''),
+            decrease: normalizeShortcutAllowPlainKey(rawConfig?.decrease || '')
+        };
+    }
+
+    /**
+     * 查找某个快捷键是否已经被“固定切换到某个倍速”的快捷键占用。
+     *
+     * @param {{ rate: number|string, shortcut: string }[]} rateConfigList
+     * @param {string} shortcut
+     * @returns {number|null}
+     */
+    function findRateShortcutConflict(rateConfigList, shortcut) {
+        if (!shortcut) {
+            return null;
+        }
+
+        for (const { rate, shortcut: configuredShortcut } of rateConfigList) {
+            if (normalizeShortcut(configuredShortcut) !== shortcut) {
+                continue;
+            }
+
+            return normalizeRate(rate);
+        }
+
+        return null;
+    }
+
+    /**
+     * 校验“增减倍速快捷键”自身是否冲突，以及是否和固定倍速快捷键撞车。
+     *
+     * @param {{ increase: string, decrease: string }} shortcutConfig
+     * @param {{ rate: number|string, shortcut: string }[]} rateConfigList
+     * @returns {{ ok: true } | { ok: false, message: string }}
+     */
+    function validateRateAdjustShortcutConfig(shortcutConfig, rateConfigList) {
+        const normalizedConfig = normalizeRateAdjustShortcutConfig(shortcutConfig);
+
+        if (
+            normalizedConfig.increase
+            && normalizedConfig.decrease
+            && normalizedConfig.increase === normalizedConfig.decrease
+        ) {
+            return {
+                ok: false,
+                message: '“增加倍速”和“减少倍速”不能使用同一个快捷键。'
+            };
+        }
+
+        const increaseConflictRate = findRateShortcutConflict(rateConfigList, normalizedConfig.increase);
+        if (increaseConflictRate !== null) {
+            return {
+                ok: false,
+                message: `“增加倍速”快捷键与 ${formatRateLabel(increaseConflictRate)} 的固定倍速快捷键冲突。`
+            };
+        }
+
+        const decreaseConflictRate = findRateShortcutConflict(rateConfigList, normalizedConfig.decrease);
+        if (decreaseConflictRate !== null) {
+            return {
+                ok: false,
+                message: `“减少倍速”快捷键与 ${formatRateLabel(decreaseConflictRate)} 的固定倍速快捷键冲突。`
+            };
+        }
+
+        return { ok: true };
+    }
+
+    /**
+     * 校验固定倍速快捷键是否和当前“增减倍速快捷键”冲突。
+     * 这样两个配置入口都能在保存前及时发现问题。
+     *
+     * @param {{ rate: number, shortcut: string }[]} rateConfigList
+     * @param {{ increase: string, decrease: string }} adjustShortcutConfig
+     * @returns {{ ok: true } | { ok: false, message: string }}
+     */
+    function validateRateConfigAgainstAdjustShortcuts(rateConfigList, adjustShortcutConfig) {
+        const normalizedAdjustShortcutConfig = normalizeRateAdjustShortcutConfig(adjustShortcutConfig);
+
+        for (const { rate, shortcut } of rateConfigList) {
+            const normalizedShortcut = normalizeShortcut(shortcut);
+            if (!normalizedShortcut) {
+                continue;
+            }
+
+            if (normalizedShortcut === normalizedAdjustShortcutConfig.increase) {
+                return {
+                    ok: false,
+                    message: `${formatRateLabel(rate)} 的固定倍速快捷键与“增加倍速”快捷键冲突。`
+                };
+            }
+
+            if (normalizedShortcut === normalizedAdjustShortcutConfig.decrease) {
+                return {
+                    ok: false,
+                    message: `${formatRateLabel(rate)} 的固定倍速快捷键与“减少倍速”快捷键冲突。`
+                };
+            }
+        }
+
+        return { ok: true };
     }
 
     /**
@@ -370,6 +567,7 @@
      */
     function registerMenuCommands() {
         GM_registerMenuCommand('编辑全部倍数和快捷键', editCustomRatesAndShortcuts);
+        GM_registerMenuCommand('设置增减倍速快捷键', editRateAdjustShortcuts);
         GM_registerMenuCommand(
             `${state.settings.twoCols ? '[✔️已启用]' : '[❌已禁用]'} 将倍数列表分为两栏显示`,
             toggleTwoColumnMenu
@@ -382,6 +580,13 @@
      */
     function editCustomRatesAndShortcuts() {
         openRateConfigDialog();
+    }
+
+    /**
+     * 编辑“增加/减少倍速”快捷键。
+     */
+    function editRateAdjustShortcuts() {
+        openRateAdjustShortcutDialog();
     }
 
     /**
@@ -406,6 +611,20 @@
     }
 
     /**
+     * 保存“增加/减少倍速快捷键”配置。
+     *
+     * @param {{ increase: string, decrease: string }} shortcutConfig
+     * @param {string} successMessage
+     */
+    function saveRateAdjustShortcutConfig(shortcutConfig, successMessage) {
+        state.settings.rateAdjustShortcuts = normalizeRateAdjustShortcutConfig(shortcutConfig);
+        GM_setValue(SETTINGS_KEY_RATE_ADJUST_SHORTCUTS, state.settings.rateAdjustShortcuts);
+        GM_setValue(SETTINGS_KEY_CONFIG_VERSION, CURRENT_CONFIG_VERSION);
+        console.log('[B站倍速助手] 已保存增减倍速快捷键', state.settings.rateAdjustShortcuts);
+        alert(successMessage);
+    }
+
+    /**
      * 确保自定义编辑弹窗只注入一次样式。
      * 这部分样式只服务于脚本自己的轻量配置面板，不会影响 B 站页面其他区域。
      */
@@ -426,7 +645,7 @@
                 background: rgba(0, 0, 0, 0.45);
             }
             .bsa-rate-dialog {
-                width: min(640px, calc(100vw - 32px));
+                width: min(320px, calc(100vw - 32px));
                 border-radius: 12px;
                 background: #fff;
                 color: #18191c;
@@ -457,6 +676,64 @@
                 font: 14px/1.6 Consolas, "Microsoft YaHei", monospace;
                 color: #18191c;
                 background: #fff;
+            }
+            .bsa-rate-dialog-form {
+                display: grid;
+                gap: 14px;
+            }
+            .bsa-rate-dialog-field {
+                display: grid;
+                gap: 6px;
+            }
+            .bsa-rate-dialog-field-inline {
+                grid-template-columns: 75px minmax(0, 1fr);
+                align-items: center;
+                gap: 0px;
+            }
+            .bsa-rate-dialog-label {
+                font-size: 14px;
+                font-weight: 600;
+                color: #18191c;
+                white-space: nowrap;
+            }
+            .bsa-rate-dialog-label-accent {
+                display: inline-block;
+            }
+            .bsa-rate-dialog-label-increase {
+                color: #fb5a7a;
+            }
+            .bsa-rate-dialog-label-decrease {
+                color: #3d7cff;
+            }
+            .bsa-rate-dialog-input {
+                width: 100%;
+                box-sizing: border-box;
+                border: 1px solid #dcdfe6;
+                border-radius: 8px;
+                padding: 10px 12px;
+                font: 14px/1.5 Consolas, "Microsoft YaHei", monospace;
+                color: #18191c;
+                background: #fff;
+            }
+            .bsa-rate-dialog-input:focus,
+            .bsa-rate-dialog-textarea:focus {
+                outline: none;
+                border-color: #00aeec;
+                box-shadow: 0 0 0 3px rgba(0, 174, 236, 0.16);
+            }
+            .bsa-rate-dialog-input-increase:focus {
+                border-color: #fb5a7a;
+                box-shadow: 0 0 0 3px rgba(251, 90, 122, 0.16);
+            }
+            .bsa-rate-dialog-input-decrease:focus {
+                border-color: #3d7cff;
+                box-shadow: 0 0 0 3px rgba(61, 124, 255, 0.16);
+            }
+            .bsa-rate-dialog-hint {
+                font-size: 12px;
+                line-height: 1.6;
+                color: #61666d;
+                white-space: pre-line;
             }
             .bsa-rate-dialog-actions {
                 display: flex;
@@ -497,11 +774,109 @@
     }
 
     /**
+     * 中央倍速提示单独注入样式，避免和配置弹窗样式耦合在一起。
+     * 提示层固定在播放器内部中央，不拦截任何鼠标事件。
+     */
+    function ensureCenterRateHintStyle() {
+        if (document.getElementById('bilibili-speed-assistant-center-hint-style')) {
+            return;
+        }
+
+        GM_addStyle(`
+            #bilibili-speed-assistant-center-hint-style {}
+            .bsa-center-rate-hint {
+                position: absolute;
+                inset: 0;
+                z-index: 30;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                pointer-events: none;
+                opacity: 0;
+                transition: opacity 180ms ease;
+            }
+            .bsa-center-rate-hint.is-visible {
+                opacity: 1;
+            }
+            .bsa-center-rate-hint-badge {
+                min-width: 88px;
+                max-width: min(54vw, 196px);
+                box-sizing: border-box;
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                border-radius: 10px;
+                padding: 8px 14px;
+                background: rgba(0, 0, 0, 0.54);
+                color: #fff;
+                text-align: center;
+                font: 600 18px/1.2 "Segoe UI", "Microsoft YaHei", sans-serif;
+                letter-spacing: 0.02em;
+                box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+            }
+        `);
+
+        const latestStyleNode = [...document.querySelectorAll('style')]
+            .reverse()
+            .find((styleNode) => styleNode.textContent?.includes('.bsa-center-rate-hint'));
+        if (latestStyleNode) {
+            latestStyleNode.id = 'bilibili-speed-assistant-center-hint-style';
+        }
+    }
+
+    /**
      * 关闭当前配置弹窗。
      */
     function closeRateConfigDialog() {
-        state.rateConfigDialogOverlay?.remove();
+        if (!state.rateConfigDialogOverlay) {
+            return;
+        }
+
+        state.rateConfigDialogOverlay.remove();
         state.rateConfigDialogOverlay = null;
+        unlockDialogPageScroll();
+    }
+
+    /**
+     * 关闭“增减倍速快捷键”配置弹窗。
+     */
+    function closeRateAdjustShortcutDialog() {
+        if (!state.rateAdjustShortcutDialogOverlay) {
+            return;
+        }
+
+        state.rateAdjustShortcutDialogOverlay.remove();
+        state.rateAdjustShortcutDialogOverlay = null;
+        unlockDialogPageScroll();
+    }
+
+    /**
+     * 打开配置弹窗时锁住页面滚动，避免背景页面继续滚动穿透。
+     */
+    function lockDialogPageScroll() {
+        if (state.dialogScrollLock) {
+            return;
+        }
+
+        state.dialogScrollLock = {
+            htmlOverflow: document.documentElement.style.overflow,
+            bodyOverflow: document.body.style.overflow
+        };
+        document.documentElement.style.overflow = 'hidden';
+        document.body.style.overflow = 'hidden';
+    }
+
+    /**
+     * 配置弹窗关闭后恢复页面滚动。
+     */
+    function unlockDialogPageScroll() {
+        if (!state.dialogScrollLock) {
+            return;
+        }
+
+        document.documentElement.style.overflow = state.dialogScrollLock.htmlOverflow;
+        document.body.style.overflow = state.dialogScrollLock.bodyOverflow;
+        state.dialogScrollLock = null;
     }
 
     /**
@@ -509,6 +884,7 @@
      * 这里改用自定义面板，是为了在同一个编辑入口里加入“重置”按钮。
      */
     function openRateConfigDialog() {
+        closeRateAdjustShortcutDialog();
         closeRateConfigDialog();
         ensureRateConfigDialogStyle();
 
@@ -531,7 +907,6 @@
             + '说明:\n'
             + '- 添加/删掉某个倍速后，页面里的对应项也会新增/消失\n'
             + '- 留空表示无任何倍速\n'
-            + '- 快捷键至少带一个修饰键，如 shift / ctrl / alt / meta\n'
             + '- 点击“重置”会恢复成网页原始默认倍速';
         dialog.appendChild(description);
 
@@ -563,11 +938,6 @@
         actions.appendChild(saveButton);
 
         cancelButton.addEventListener('click', closeRateConfigDialog);
-        overlay.addEventListener('click', (event) => {
-            if (event.target === overlay) {
-                closeRateConfigDialog();
-            }
-        });
         dialog.addEventListener('click', (event) => {
             event.stopPropagation();
         });
@@ -576,6 +946,16 @@
             const parsedResult = parseRateConfigText(textarea.value);
             if (!parsedResult.ok) {
                 alert(`格式不正确，请检查这一段: \n${parsedResult.error}`);
+                textarea.focus();
+                return;
+            }
+
+            const shortcutValidationResult = validateRateConfigAgainstAdjustShortcuts(
+                parsedResult.value,
+                state.settings.rateAdjustShortcuts
+            );
+            if (!shortcutValidationResult.ok) {
+                alert(shortcutValidationResult.message);
                 textarea.focus();
                 return;
             }
@@ -613,8 +993,216 @@
 
         document.body.appendChild(overlay);
         state.rateConfigDialogOverlay = overlay;
+        lockDialogPageScroll();
         textarea.focus();
         textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    }
+
+    /**
+     * 给快捷键输入框绑定“按键捕获”行为。
+     *
+     * @param {HTMLInputElement} input
+     */
+    function bindShortcutCaptureInput(input) {
+        input.addEventListener('keydown', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+
+            if (event.key === 'Escape') {
+                input.blur();
+                return;
+            }
+
+            if (event.key === 'Backspace' || event.key === 'Delete') {
+                input.dataset.shortcutValue = '';
+                input.value = '';
+                return;
+            }
+
+            const normalizedShortcut = normalizeShortcutFromKeyboardEvent(event, false);
+            if (!normalizedShortcut) {
+                return;
+            }
+
+            input.dataset.shortcutValue = normalizedShortcut;
+            input.value = formatShortcutDisplayText(normalizedShortcut);
+        });
+    }
+
+    /**
+     * 把某个快捷键输入框同步成“内部真实值 + 外部显示值”。
+     * 这样方向键可以显示成箭头，但保存时仍然拿到标准化后的原始快捷键字符串。
+     *
+     * @param {HTMLInputElement} input
+     * @param {string} shortcut
+     */
+    function setShortcutCaptureInputValue(input, shortcut) {
+        const normalizedShortcut = normalizeRateAdjustShortcutConfig({
+            increase: shortcut
+        }).increase;
+        input.dataset.shortcutValue = normalizedShortcut;
+        input.value = formatShortcutDisplayText(normalizedShortcut);
+    }
+
+    /**
+     * 读取快捷键输入框内部保存的真实快捷键值。
+     *
+     * @param {HTMLInputElement} input
+     * @returns {string}
+     */
+    function getShortcutCaptureInputValue(input) {
+        return normalizeShortcutAllowPlainKey(input.dataset.shortcutValue || input.value || '');
+    }
+
+    /**
+     * 把内部使用的快捷键字符串格式化成更适合展示的文本。
+     * 这里只影响输入框显示，不影响实际存储值和匹配逻辑。
+     *
+     * 例如：
+     * - `arrowup` -> `↑`
+     * - `ctrl+arrowleft` -> `ctrl+←`
+     *
+     * @param {string} shortcut
+     * @returns {string}
+     */
+    function formatShortcutDisplayText(shortcut) {
+        const normalizedShortcut = String(shortcut || '').trim().toLowerCase();
+        if (!normalizedShortcut) {
+            return '';
+        }
+
+        const displayAliasMap = {
+            arrowup: '↑',
+            arrowdown: '↓',
+            arrowleft: '←',
+            arrowright: '→'
+        };
+
+        return normalizedShortcut
+            .split('+')
+            .map((part) => displayAliasMap[part] || part)
+            .join('+');
+    }
+
+    /**
+     * 打开“增减倍速快捷键”设置面板。
+     * 这里把“增加”和“减少”拆成两个独立输入框，避免和原来的倍速列表文本格式混在一起。
+     */
+    function openRateAdjustShortcutDialog() {
+        closeRateConfigDialog();
+        closeRateAdjustShortcutDialog();
+        ensureRateConfigDialogStyle();
+
+        const overlay = document.createElement('div');
+        overlay.className = 'bsa-rate-dialog-overlay';
+
+        const dialog = document.createElement('div');
+        dialog.className = 'bsa-rate-dialog';
+        overlay.appendChild(dialog);
+
+        const title = document.createElement('h3');
+        title.className = 'bsa-rate-dialog-title';
+        title.textContent = '设置增减倍速快捷键';
+        dialog.appendChild(title);
+
+        const form = document.createElement('div');
+        form.className = 'bsa-rate-dialog-form';
+        dialog.appendChild(form);
+
+        const increaseField = document.createElement('div');
+        increaseField.className = 'bsa-rate-dialog-field bsa-rate-dialog-field-inline';
+        form.appendChild(increaseField);
+
+        const increaseLabel = document.createElement('label');
+        increaseLabel.className = 'bsa-rate-dialog-label bsa-rate-dialog-label-accent bsa-rate-dialog-label-increase';
+        increaseLabel.textContent = '增加倍速 +';
+        increaseField.appendChild(increaseLabel);
+
+        const increaseInput = document.createElement('input');
+        increaseInput.type = 'text';
+        increaseInput.className = 'bsa-rate-dialog-input bsa-rate-dialog-input-increase';
+        increaseInput.placeholder = '点击后按下组合键';
+        increaseInput.readOnly = true;
+        setShortcutCaptureInputValue(increaseInput, state.settings.rateAdjustShortcuts.increase);
+        increaseField.appendChild(increaseInput);
+
+        const decreaseField = document.createElement('div');
+        decreaseField.className = 'bsa-rate-dialog-field bsa-rate-dialog-field-inline';
+        form.appendChild(decreaseField);
+
+        const decreaseLabel = document.createElement('label');
+        decreaseLabel.className = 'bsa-rate-dialog-label bsa-rate-dialog-label-accent bsa-rate-dialog-label-decrease';
+        decreaseLabel.textContent = '减少倍速 -';
+        decreaseField.appendChild(decreaseLabel);
+
+        const decreaseInput = document.createElement('input');
+        decreaseInput.type = 'text';
+        decreaseInput.className = 'bsa-rate-dialog-input bsa-rate-dialog-input-decrease';
+        decreaseInput.placeholder = '点击后按下组合键';
+        decreaseInput.readOnly = true;
+        setShortcutCaptureInputValue(decreaseInput, state.settings.rateAdjustShortcuts.decrease);
+        decreaseField.appendChild(decreaseInput);
+
+        bindShortcutCaptureInput(increaseInput);
+        bindShortcutCaptureInput(decreaseInput);
+
+        const actions = document.createElement('div');
+        actions.className = 'bsa-rate-dialog-actions';
+        dialog.appendChild(actions);
+
+        const cancelButton = document.createElement('button');
+        cancelButton.type = 'button';
+        cancelButton.className = 'bsa-rate-dialog-button';
+        cancelButton.textContent = '取消';
+        actions.appendChild(cancelButton);
+
+        const saveButton = document.createElement('button');
+        saveButton.type = 'button';
+        saveButton.className = 'bsa-rate-dialog-button bsa-rate-dialog-button-primary';
+        saveButton.textContent = '保存';
+        actions.appendChild(saveButton);
+
+        cancelButton.addEventListener('click', closeRateAdjustShortcutDialog);
+        dialog.addEventListener('click', (event) => {
+            event.stopPropagation();
+        });
+
+        saveButton.addEventListener('click', () => {
+            const nextShortcutConfig = normalizeRateAdjustShortcutConfig({
+                increase: getShortcutCaptureInputValue(increaseInput),
+                decrease: getShortcutCaptureInputValue(decreaseInput)
+            });
+            const validationResult = validateRateAdjustShortcutConfig(
+                nextShortcutConfig,
+                state.settings.customRates
+            );
+            if (!validationResult.ok) {
+                alert(validationResult.message);
+                return;
+            }
+
+            closeRateAdjustShortcutDialog();
+            saveRateAdjustShortcutConfig(
+                nextShortcutConfig,
+                '已保存增减倍速快捷键，当前页面无需刷新即可生效。'
+            );
+        });
+
+        overlay.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                closeRateAdjustShortcutDialog();
+                return;
+            }
+
+            if (event.key === 'Enter' && event.ctrlKey) {
+                saveButton.click();
+            }
+        });
+
+        document.body.appendChild(overlay);
+        state.rateAdjustShortcutDialogOverlay = overlay;
+        lockDialogPageScroll();
+        increaseInput.focus();
     }
 
     /**
@@ -775,6 +1363,84 @@
     }
 
     /**
+     * 获取播放器容器，中央提示优先挂在这里。
+     * 这样提示会跟着视频区域一起移动，而不是固定在整页正中间。
+     *
+     * @returns {HTMLElement|null}
+     */
+    function findPlayerContainer() {
+        const container = queryFirst(SELECTORS.playerContainer);
+        return container instanceof HTMLElement ? container : null;
+    }
+
+    /**
+     * 在视频中央显示当前倍速提示。
+     * 这里只在“快捷键主动改动倍速”时调用，不干扰自动恢复历史倍速这类后台行为。
+     *
+     * @param {number|string} rate
+     */
+    function showCenterRateHint(rate) {
+        const normalizedRate = normalizeRate(rate);
+        if (normalizedRate === null) {
+            return;
+        }
+
+        const playerContainer = findPlayerContainer();
+        if (!playerContainer) {
+            return;
+        }
+
+        ensureCenterRateHintStyle();
+
+        /**
+         * 提示层使用 absolute 定位，为了让它稳定覆盖在播放器内部，
+         * 当宿主容器还是 static 时，这里补成 relative。
+         */
+        if (window.getComputedStyle(playerContainer).position === 'static') {
+            playerContainer.style.position = 'relative';
+        }
+
+        if (state.centerRateHintHost && state.centerRateHintHost !== playerContainer) {
+            state.centerRateHintElement?.remove();
+            state.centerRateHintElement = null;
+        }
+
+        state.centerRateHintHost = playerContainer;
+
+        if (!state.centerRateHintElement || !state.centerRateHintElement.isConnected) {
+            const hint = document.createElement('div');
+            hint.className = 'bsa-center-rate-hint';
+
+            const badge = document.createElement('div');
+            badge.className = 'bsa-center-rate-hint-badge';
+            hint.appendChild(badge);
+
+            playerContainer.appendChild(hint);
+            state.centerRateHintElement = hint;
+        }
+
+        const badge = state.centerRateHintElement.querySelector('.bsa-center-rate-hint-badge');
+        if (!(badge instanceof HTMLElement)) {
+            return;
+        }
+
+        badge.textContent = `倍速 ${formatRateLabel(normalizedRate)}`;
+        clearTimeout(state.centerRateHintHideTimer);
+        clearTimeout(state.centerRateHintRemoveTimer);
+
+        state.centerRateHintElement.classList.add('is-visible');
+
+        state.centerRateHintHideTimer = window.setTimeout(() => {
+            state.centerRateHintElement?.classList.remove('is-visible');
+        }, CENTER_RATE_HINT_HIDE_DELAY);
+
+        state.centerRateHintRemoveTimer = window.setTimeout(() => {
+            state.centerRateHintElement?.remove();
+            state.centerRateHintElement = null;
+        }, CENTER_RATE_HINT_REMOVE_DELAY);
+    }
+
+    /**
      * 只同步“倍速按钮”上的文本，不碰菜单激活态。
      * 这个函数单独拆出来，是为了在需要时可以只修正显示文字，
      * 减少对菜单 hover 状态的额外干扰。
@@ -812,6 +1478,76 @@
                 }
             }, delay);
             state.resultTextSyncTimers.push(timerId);
+        });
+    }
+
+    /**
+     * 清理“倍速应用重试”定时器。
+     * 这里单独收口，是为了在用户快速连点切换倍速、播放器替换 video 节点、
+     * 或站内切到下一个视频时，能立刻取消上一轮过期的强制写入。
+     */
+    function clearPendingPlaybackRateApply() {
+        state.playbackRateApplyTimers.forEach((timerId) => clearTimeout(timerId));
+        state.playbackRateApplyTimers = [];
+        state.pendingPlaybackRateApply = {
+            videoElement: null,
+            targetRate: null
+        };
+    }
+
+    /**
+     * 带短时重试地设置倍速。
+     * B 站播放器在刚打开视频后的 1~2 秒内，偶尔还会继续跑自己的初始化流程，
+     * 导致脚本刚写进去的 playbackRate 又被页面逻辑覆盖回去。
+     * 这里把“立即设置 + 短时间补写几次”收敛成统一入口，专门兜住这个时间窗口。
+     *
+     * @param {HTMLVideoElement|null} video
+     * @param {number|string} targetRate
+     */
+    function applyPlaybackRateWithRetry(video, targetRate) {
+        const normalizedTargetRate = normalizeRate(targetRate);
+        if (!(video instanceof HTMLVideoElement) || normalizedTargetRate === null) {
+            return;
+        }
+
+        clearPendingPlaybackRateApply();
+        state.pendingPlaybackRateApply = {
+            videoElement: video,
+            targetRate: normalizedTargetRate
+        };
+
+        PLAYBACK_RATE_APPLY_RETRY_DELAYS.forEach((delay, index) => {
+            const timerId = setTimeout(() => {
+                const {
+                    videoElement: pendingVideo,
+                    targetRate: pendingTargetRate
+                } = state.pendingPlaybackRateApply;
+
+                /**
+                 * 只允许“当前这轮仍然有效”的重试继续执行。
+                 * 一旦用户改点了别的倍速，或者页面已经切到新 video，
+                 * 旧定时器即使晚到，也不会再把倍速写回老目标值。
+                 */
+                if (
+                    pendingVideo !== video
+                    || pendingTargetRate !== normalizedTargetRate
+                    || state.currentVideo !== video
+                    || !video.isConnected
+                ) {
+                    return;
+                }
+
+                if (normalizeRate(video.playbackRate) !== normalizedTargetRate) {
+                    video.playbackRate = normalizedTargetRate;
+                } else {
+                    syncRateMenuUI(normalizedTargetRate);
+                }
+
+                if (index === PLAYBACK_RATE_APPLY_RETRY_DELAYS.length - 1) {
+                    clearPendingPlaybackRateApply();
+                }
+            }, delay);
+            state.playbackRateApplyTimers.push(timerId);
         });
     }
 
@@ -862,6 +1598,7 @@
      */
     function bindVideoEvents(video) {
         if (state.currentVideo && state.currentVideo !== video) {
+            clearPendingPlaybackRateApply();
             state.currentVideo.removeEventListener('ratechange', handleRateChange);
             state.currentVideo.removeEventListener('loadedmetadata', handleVideoReload);
             state.currentVideo.removeEventListener('emptied', handleVideoReload);
@@ -1037,8 +1774,7 @@
                     return;
                 }
 
-                currentVideo.playbackRate = rate;
-                syncRateMenuUI(rate);
+                applyPlaybackRateWithRetry(currentVideo, rate);
             });
             menu.appendChild(newItem);
         });
@@ -1114,14 +1850,193 @@
     }
 
     /**
+     * 根据快捷键查找对应的“增减倍速动作”。
+     *
+     * @param {string} shortcut
+     * @returns {'increase'|'decrease'|''}
+     */
+    function getRateAdjustActionByShortcut(shortcut) {
+        const normalizedShortcut = normalizeShortcutAllowPlainKey(shortcut);
+        if (!normalizedShortcut) {
+            return '';
+        }
+
+        if (normalizedShortcut === state.settings.rateAdjustShortcuts.increase) {
+            return 'increase';
+        }
+
+        if (normalizedShortcut === state.settings.rateAdjustShortcuts.decrease) {
+            return 'decrease';
+        }
+
+        return '';
+    }
+
+    /**
+     * 把目标倍速限制在合理区间内。
+     * 这里保留到两位小数，避免 1.25 这类原本就存在的小数倍速被错误抹平。
+     *
+     * @param {number|string} rate
+     * @returns {number|null}
+     */
+    function clampPlaybackRate(rate) {
+        const normalizedRate = normalizeRate(rate);
+        if (normalizedRate === null) {
+            return null;
+        }
+
+        return normalizeRate(Math.min(Math.max(normalizedRate, MIN_PLAYBACK_RATE), MAX_PLAYBACK_RATE));
+    }
+
+    /**
+     * 根据动作返回这次应该增减多少倍速。
+     *
+     * @param {'increase'|'decrease'} action
+     * @returns {number}
+     */
+    function getPlaybackRateAdjustDelta(action) {
+        return action === 'increase' ? PLAYBACK_RATE_ADJUST_STEP : -PLAYBACK_RATE_ADJUST_STEP;
+    }
+
+    /**
+     * 按 0.1x 步长调整当前视频倍速。
+     * 当前倍速来自哪里并不重要，因为这里直接基于真实的 `video.playbackRate` 继续细调。
+     *
+     * @param {'increase'|'decrease'} action
+     * @returns {boolean}
+     */
+    function adjustCurrentPlaybackRate(action) {
+        const video = findVideoElement();
+        if (!video) {
+            return false;
+        }
+
+        const currentRate = normalizeRate(video.playbackRate) ?? DEFAULT_PLAYBACK_RATE;
+        const targetRate = clampPlaybackRate(currentRate + getPlaybackRateAdjustDelta(action));
+        if (targetRate === null || targetRate === currentRate) {
+            return false;
+        }
+
+        applyPlaybackRateWithRetry(video, targetRate);
+        showCenterRateHint(targetRate);
+        console.log(`[B站倍速助手] 已通过增减快捷键调整到 ${targetRate}x`);
+        return true;
+    }
+
+    /**
+     * 根据长按时长决定下一次连续调整的间隔。
+     * 这里复用 `easeOutCubic`，让长按从“细调”自然过渡到“快速连发”。
+     *
+     * @param {number} heldDurationMs
+     * @returns {number}
+     */
+    function getPlaybackRateAdjustHoldDelay(heldDurationMs) {
+        const maxDelay = 180;
+        const minDelay = 40;
+        const accelerateDuration = 1100;
+        const progress = Math.min(Math.max(heldDurationMs / accelerateDuration, 0), 1);
+        const easedProgress = 1 - Math.pow(1 - progress, 3);
+        return Math.round(maxDelay - (maxDelay - minDelay) * easedProgress);
+    }
+
+    /**
+     * 停止当前增减倍速长按链路。
+     */
+    function stopRateAdjustHold() {
+        clearTimeout(state.rateAdjustHoldTimer);
+        state.rateAdjustHoldTimer = 0;
+        state.rateAdjustHoldAction = '';
+        state.rateAdjustHoldShortcut = '';
+        state.rateAdjustHoldStartedAt = 0;
+    }
+
+    /**
+     * 调度下一次长按连续调整。
+     * 这里使用递归 `setTimeout`，这样每一轮都能基于当前长按时长重新计算间隔。
+     */
+    function scheduleNextRateAdjustHold() {
+        if (!state.rateAdjustHoldAction) {
+            return;
+        }
+
+        clearTimeout(state.rateAdjustHoldTimer);
+        const heldDurationMs = Date.now() - state.rateAdjustHoldStartedAt;
+        const delay = getPlaybackRateAdjustHoldDelay(heldDurationMs);
+
+        state.rateAdjustHoldTimer = window.setTimeout(() => {
+            if (!state.rateAdjustHoldAction) {
+                return;
+            }
+
+            adjustCurrentPlaybackRate(/** @type {'increase'|'decrease'} */ (state.rateAdjustHoldAction));
+            scheduleNextRateAdjustHold();
+        }, delay);
+    }
+
+    /**
+     * 开始处理“单击 + 长按加速”的增减倍速链路。
+     *
+     * @param {'increase'|'decrease'} action
+     * @param {string} shortcut
+     */
+    function startRateAdjustHold(action, shortcut) {
+        if (state.rateAdjustHoldShortcut === shortcut) {
+            return;
+        }
+
+        stopRateAdjustHold();
+        state.rateAdjustHoldAction = action;
+        state.rateAdjustHoldShortcut = shortcut;
+        state.rateAdjustHoldStartedAt = Date.now();
+
+        adjustCurrentPlaybackRate(action);
+        scheduleNextRateAdjustHold();
+    }
+
+    /**
+     * 判断某次 keyup 是否应该终止当前长按调整。
+     * 正常情况下，松开主键就会命中完整快捷键；
+     * 如果用户先松修饰键，这里也要及时停掉，避免后台继续连发。
+     *
+     * @param {KeyboardEvent} event
+     * @returns {boolean}
+     */
+    function shouldStopRateAdjustHoldByKeyup(event) {
+        if (!state.rateAdjustHoldShortcut) {
+            return false;
+        }
+
+        const normalizedShortcut = normalizeShortcutFromKeyboardEvent(event, false);
+        if (normalizedShortcut && normalizedShortcut === state.rateAdjustHoldShortcut) {
+            return true;
+        }
+
+        if (event.key === 'Control' && state.rateAdjustHoldShortcut.includes('ctrl+')) {
+            return true;
+        }
+        if (event.key === 'Alt' && state.rateAdjustHoldShortcut.includes('alt+')) {
+            return true;
+        }
+        if (event.key === 'Shift' && state.rateAdjustHoldShortcut.includes('shift+')) {
+            return true;
+        }
+        if (event.key === 'Meta' && state.rateAdjustHoldShortcut.includes('meta+')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
      * 把 KeyboardEvent 里的按键转换成可和配置字符串对比的标准形式.
      * 对包含 shift 的符号键，需要回推成原始按键:
      * 例如 event.key 可能是 "#"，但我们希望匹配成 "3".
      *
      * @param {KeyboardEvent} event
+     * @param {boolean} [requireModifier=true]
      * @returns {string}
      */
-    function normalizeShortcutFromKeyboardEvent(event) {
+    function normalizeShortcutFromKeyboardEvent(event, requireModifier = true) {
         const keyAliasMap = {
             ' ': 'space',
             Spacebar: 'space',
@@ -1181,7 +2096,11 @@
             parts.push('meta');
         }
 
-        if (parts.length === 0 || !normalizedKey) {
+        if (!normalizedKey) {
+            return '';
+        }
+
+        if (requireModifier && parts.length === 0) {
             return '';
         }
 
@@ -1209,8 +2128,31 @@
      * 配置发生变化后不需要重复安装，因为这里每次按键都会实时从 state.settings 重新构建映射.
      */
     function installShortcutListener() {
-        window.addEventListener('keydown', (event) => {
+        const handleKeydown = (event) => {
+            if (event.defaultPrevented || event.isComposing) {
+                return;
+            }
+
             if (shouldIgnoreShortcutTarget(event.target)) {
+                return;
+            }
+
+            const adjustShortcut = normalizeShortcutFromKeyboardEvent(event, false);
+            const rateAdjustAction = getRateAdjustActionByShortcut(adjustShortcut);
+            if (rateAdjustAction) {
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation();
+
+                /**
+                 * 原生 key repeat 不参与增减倍速，
+                 * 否则会和脚本自己的缓动连发叠加，导致节奏失控。
+                 */
+                if (event.repeat) {
+                    return;
+                }
+
+                startRateAdjustHold(rateAdjustAction, adjustShortcut);
                 return;
             }
 
@@ -1232,10 +2174,30 @@
 
             event.preventDefault();
             event.stopPropagation();
-            video.playbackRate = targetRate;
-            syncRateMenuUI(targetRate);
+            event.stopImmediatePropagation();
+            applyPlaybackRateWithRetry(video, targetRate);
+            showCenterRateHint(targetRate);
             console.log(`[B站倍速助手] 已通过快捷键切换到 ${targetRate}x`);
-        }, true);
+        };
+
+        const handleKeyup = (event) => {
+            if (shouldStopRateAdjustHoldByKeyup(event)) {
+                stopRateAdjustHold();
+            }
+        };
+
+        const handleForceStopHold = () => {
+            stopRateAdjustHold();
+        };
+
+        window.addEventListener('keydown', handleKeydown, true);
+        window.addEventListener('keyup', handleKeyup, true);
+        window.addEventListener('blur', handleForceStopHold);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                stopRateAdjustHold();
+            }
+        });
     }
 
     /**
@@ -1267,31 +2229,17 @@
         }
 
         /**
-         * 既然现在“配置列表”就是最终倍速菜单，
-         * 那么历史记录中的倍速如果已经不在列表里，就不再恢复，并顺手清掉旧缓存。
+         * 这里不再要求“历史倍速必须存在于当前菜单配置中”。
+         * 因为新增了 0.1x 步长的增减快捷键后，用户完全可能把视频调到 1.3x / 1.4x / 1.6x
+         * 这类不在菜单里的倍速。如果仍然沿用旧规则，这些倍速就会被记住但无法恢复。
+         *
+         * 因此现在只要缓存里的倍速本身合法，就允许恢复；
+         * 如果菜单里没有对应项，界面只是不高亮任何菜单项，但“倍速按钮文本”和实际倍速仍会正确同步。
+         *
+         * 直接设置 video.playbackRate，由 ratechange 监听器负责统一做 UI 同步和记录更新。
+         * 这样逻辑比“模拟鼠标点击播放器菜单”更简单，也更不容易被页面结构细节击穿。
          */
-        const isRateStillConfigured = state.settings.customRates
-            .some(({ rate }) => normalizeRate(rate) === targetRate);
-        if (!isRateStillConfigured) {
-            localStorage.removeItem(state.currentVideoKey);
-            state.lastSavedRate = null;
-            state.restoreMark = {
-                videoKey: state.currentVideoKey,
-                videoElement: video
-            };
-            console.log(`[B站倍速助手] 已跳过恢复 ${targetRate}x，因为它已不在当前完整倍速列表中`);
-            return;
-        }
-
-        /**
-         * 直接设置 video.playbackRate，由 ratechange 监听器负责统一做 UI 同步和记录更新.
-         * 这样逻辑比“模拟鼠标点击播放器菜单”更简单，也更不容易被页面结构细节击穿.
-         */
-        if (normalizeRate(video.playbackRate) !== targetRate) {
-            video.playbackRate = targetRate;
-        } else {
-            syncRateMenuUI(targetRate);
-        }
+        applyPlaybackRateWithRetry(video, targetRate);
 
         state.restoreMark = {
             videoKey: state.currentVideoKey,
@@ -1353,6 +2301,7 @@
             return;
         }
 
+        clearPendingPlaybackRateApply();
         state.currentVideoKey = nextVideoKey;
         state.lastSavedRate = loadSavedRate(nextVideoKey);
         state.restoreMark = {
