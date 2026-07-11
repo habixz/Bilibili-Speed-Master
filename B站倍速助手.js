@@ -134,6 +134,10 @@
             videoElement: null,
             targetRate: null
         },
+        pendingRestoreRate: {
+            videoElement: null,
+            targetRate: null
+        },
         centerRateHintHost: null,
         centerRateHintElement: null,
         centerRateHintHideTimer: 0,
@@ -600,11 +604,11 @@
         state.settings.customRates = normalizeRateConfigList(configList);
         GM_setValue(SETTINGS_KEY_RATES, state.settings.customRates);
         GM_setValue(SETTINGS_KEY_CONFIG_VERSION, CURRENT_CONFIG_VERSION);
-        console.log('[B站倍速助手] 已保存完整倍速菜单和快捷键', state.settings.customRates);
+        console.log('[B站倍速助手] 已保存脚本倍速列表和快捷键', state.settings.customRates);
 
         /**
          * 配置变更后，立刻重新尝试接管一次播放器，
-         * 这样当前页面的倍速菜单会马上按最新列表完整重建.
+         * 这样当前页面会马上按最新配置重排菜单，并补充额外倍速项。
          */
         scheduleBootstrap(0);
         alert(successMessage);
@@ -897,7 +901,7 @@
 
         const title = document.createElement('h3');
         title.className = 'bsa-rate-dialog-title';
-        title.textContent = '编辑全部倍数和快捷键';
+        title.textContent = '编辑脚本倍数和快捷键';
         dialog.appendChild(title);
 
         const description = document.createElement('p');
@@ -905,9 +909,10 @@
         description.textContent = '格式: 倍数1, 倍数2, 倍数3(快捷键)\n'
             + '示例: 0.5, 1, 1.5, 2, 3(ctrl+shift+7)\n'
             + '说明:\n'
-            + '- 添加/删掉某个倍速后，页面里的对应项也会新增/消失\n'
-            + '- 留空表示无任何倍速\n'
-            + '- 点击“重置”会恢复成网页原始默认倍速';
+            + '- 网页原生自带的倍速项会保留；这里主要控制脚本补充的倍速和对应快捷键\n'
+            + '- 新增的额外倍速会补进菜单；删掉后只会移除脚本补充项，不会删除网页原生档位\n'
+            + '- 留空表示不额外补充任何脚本倍速\n'
+            + '- 点击“重置”会把脚本倍速列表恢复为网页原始默认档';
         dialog.appendChild(description);
 
         const textarea = document.createElement('textarea');
@@ -963,12 +968,12 @@
             closeRateConfigDialog();
             saveRateConfig(
                 parsedResult.value,
-                '已保存，当前页面会立即按你的完整倍速列表重建菜单.若页面结构尚未就绪，可手动再刷新一次.'
+                '已保存，当前页面会立即按你的配置同步菜单：原生项会保留，额外项会按配置补充。'
             );
         });
 
         resetButton.addEventListener('click', () => {
-            const shouldReset = confirm('确定要重置为网页原始默认倍速吗？这会覆盖你当前自定义的倍速列表。');
+            const shouldReset = confirm('确定要把脚本倍速列表重置为网页原始默认档吗？这会覆盖你当前脚本配置。');
             if (!shouldReset) {
                 return;
             }
@@ -976,7 +981,7 @@
             closeRateConfigDialog();
             saveRateConfig(
                 LEGACY_BUILTIN_RATES,
-                '已重置为网页原始默认倍速，当前页面会立即重建倍速菜单。'
+                '已重置脚本倍速列表，当前页面会立即按默认档同步菜单。'
             );
         });
 
@@ -1652,6 +1657,254 @@
     }
 
     /**
+     * 立即把当前视频的倍速写入“按视频记忆”缓存。
+     *
+     * 这里和 `handleRateChange` 里的持久化逻辑共用同一入口，目的是让：
+     * - 脚本主动改倍速时，记录立刻落盘，不再完全依赖浏览器后续是否触发 `ratechange`
+     * - 同一个视频刷新页面后，能够稳定按 1 天有效期恢复
+     * - 不同视频之间仍然彼此隔离，不会串倍速
+     *
+     * @param {number|string} rate
+     * @param {HTMLVideoElement|null} video
+     */
+    function persistRateForCurrentVideo(rate, video) {
+        const normalizedRate = normalizeRate(rate);
+        if (!state.currentVideoKey || normalizedRate === null) {
+            return;
+        }
+
+        state.restoreMark = {
+            videoKey: state.currentVideoKey,
+            videoElement: video instanceof HTMLVideoElement ? video : null
+        };
+
+        if (normalizedRate === DEFAULT_PLAYBACK_RATE) {
+            localStorage.removeItem(state.currentVideoKey);
+            state.lastSavedRate = null;
+            console.log('[B站倍速助手] 当前视频已恢复为 1x，已清除该视频的倍速记录');
+            return;
+        }
+
+        state.lastSavedRate = normalizedRate;
+        localStorage.setItem(state.currentVideoKey, JSON.stringify({
+            rate: normalizedRate,
+            timestamp: Date.now()
+        }));
+        console.log(`[B站倍速助手] 已记录当前视频倍速: ${normalizedRate}x`);
+    }
+
+    /**
+     * 处理“脚本主动发起”的倍速变更。
+     *
+     * 和“自动恢复历史倍速”区分开来的原因是：
+     * - 用户主动调整时，要立即刷新当前视频的 1 天有效期记录
+     * - 自动恢复历史时，只需要读记录并应用，不应该把“恢复动作”本身再视为一次新的用户操作
+     *
+     * @param {HTMLVideoElement|null} video
+     * @param {number|string} targetRate
+     * @param {{ preferNativeMenuItem?: boolean }} [options]
+     */
+    function applyPlaybackRateFromUserAction(video, targetRate, options = {}) {
+        const normalizedTargetRate = normalizeRate(targetRate);
+        if (!(video instanceof HTMLVideoElement) || normalizedTargetRate === null) {
+            return;
+        }
+
+        const { preferNativeMenuItem = true } = options;
+
+        /**
+         * 对于 B 站原生本来就存在的倍速，优先尝试触发原生菜单项。
+         * 这样能尽量保留播放器内部原生逻辑，例如合集内倍速继承等行为。
+         *
+         * 但这里不能再沿用“只要找到了原生项就视为成功”的旧思路：
+         * synthetic click 可能被页面接住，也可能没有真正把播放器切到目标倍速。
+         * 因此只有在触发后确认当前 video.playbackRate 已经到达目标值时，才算原生切换成功；
+         * 否则必须回退到脚本自己直接设置 playbackRate。
+         */
+        if (preferNativeMenuItem && triggerNativeRateMenuItem(video, normalizedTargetRate)) {
+            persistRateForCurrentVideo(normalizedTargetRate, video);
+            syncRateMenuUI(normalizedTargetRate);
+            return;
+        }
+
+        applyPlaybackRateWithRetry(video, normalizedTargetRate);
+        persistRateForCurrentVideo(normalizedTargetRate, video);
+    }
+
+    /**
+     * 判断某个菜单项是否由脚本创建。
+     *
+     * @param {HTMLElement} menuItem
+     * @returns {boolean}
+     */
+    function isScriptCustomRateMenuItem(menuItem) {
+        return menuItem.dataset[CUSTOM_ITEM_MARK] === '1';
+    }
+
+    /**
+     * 只获取 B 站原生菜单项。
+     * 这些节点必须尽量保留，因为它们背后可能挂着播放器自己的内部逻辑。
+     *
+     * @param {HTMLElement|null} menu
+     * @returns {HTMLElement[]}
+     */
+    function getNativeRateMenuItems(menu) {
+        return getRateMenuItems(menu).filter((menuItem) => !isScriptCustomRateMenuItem(menuItem));
+    }
+
+    /**
+     * 读取当前配置里的所有合法倍速。
+     *
+     * @returns {number[]}
+     */
+    function getConfiguredRates() {
+        return state.settings.customRates
+            .map(({ rate }) => normalizeRate(rate))
+            .filter((rate) => rate !== null);
+    }
+
+    /**
+     * 把“原生已有倍速”和“脚本配置倍速”做并集，再计算最终渲染顺序。
+     *
+     * 这里改成并集，而不是再把原生菜单整套删掉重建，目的是：
+     * - 原生项继续保留
+     * - 原生项继续走 B 站原本的点击逻辑
+     * - 脚本只额外补充菜单里原本不存在的倍速项
+     *
+     * @param {HTMLElement|null} menu
+     * @returns {number[]}
+     */
+    function buildDesiredMenuRates(menu) {
+        const nativeRates = getNativeRateMenuItems(menu)
+            .map((menuItem) => parseRateFromMenuItem(menuItem))
+            .filter((rate) => rate !== null);
+        const configuredRates = getConfiguredRates();
+        const mergedRates = [...new Set([...nativeRates, ...configuredRates])]
+            .sort((left, right) => left - right);
+        return buildMenuRenderRates(mergedRates);
+    }
+
+    /**
+     * 按倍速查找当前菜单里的原生项。
+     *
+     * @param {HTMLElement|null} menu
+     * @param {number|string} rate
+     * @returns {HTMLElement|null}
+     */
+    function findNativeRateMenuItemByRate(menu, rate) {
+        const normalizedRate = normalizeRate(rate);
+        if (normalizedRate === null) {
+            return null;
+        }
+
+        return getNativeRateMenuItems(menu)
+            .find((menuItem) => parseRateFromMenuItem(menuItem) === normalizedRate) || null;
+    }
+
+    /**
+     * 尝试触发 B 站原生菜单项，并立即确认是否真的切到了目标倍速。
+     * 只有确认成功时才返回 true，避免把“找到了原生项”误判成“切换已经成功”。
+     *
+     * @param {HTMLVideoElement|null} video
+     * @param {number|string} rate
+     * @returns {boolean}
+     */
+    function triggerNativeRateMenuItem(video, rate) {
+        if (!(video instanceof HTMLVideoElement)) {
+            return false;
+        }
+
+        const normalizedRate = normalizeRate(rate);
+        if (normalizedRate === null) {
+            return false;
+        }
+
+        const menu = findPlaybackRateMenu();
+        const nativeMenuItem = findNativeRateMenuItemByRate(menu, normalizedRate);
+        if (!nativeMenuItem) {
+            return false;
+        }
+
+        nativeMenuItem.dispatchEvent(new MouseEvent('click', {
+            bubbles: true,
+            cancelable: true,
+            view: window
+        }));
+        return normalizeRate(video.playbackRate) === normalizedRate;
+    }
+
+    /**
+     * 创建一个脚本额外补充的倍速菜单项。
+     * 只有当前目标倍速不在原生菜单里时，才会创建这种节点。
+     *
+     * @param {HTMLElement|null} templateItem
+     * @param {number} rate
+     * @returns {HTMLElement}
+     */
+    function createCustomRateMenuItem(templateItem, rate) {
+        const newItem = document.createElement('li');
+        newItem.className = templateItem
+            ? templateItem.className.replace(/\bbpx-state-active\b/g, '').trim()
+            : 'bpx-player-ctrl-playbackrate-menu-item';
+        newItem.dataset.value = String(rate);
+        newItem.dataset[CUSTOM_ITEM_MARK] = '1';
+        newItem.textContent = formatRateLabel(rate);
+
+        /**
+         * 这些是脚本补出来的菜单项，B 站原生本身并不认识它们。
+         * 因此点击时必须完全拦截，避免冒泡到父级后造成“看起来像原生点击，
+         * 实际却夹杂脚本逻辑”的混合状态。
+         */
+        newItem.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+
+            const currentVideo = findVideoElement();
+            if (!currentVideo) {
+                return;
+            }
+
+            applyPlaybackRateFromUserAction(currentVideo, rate);
+        });
+
+        return newItem;
+    }
+
+    /**
+     * 判断当前菜单结构是否已经与“原生项保留 + 脚本项追加”后的目标状态一致。
+     * 一致时直接复用，避免刷新阶段反复改 DOM 导致菜单难点。
+     *
+     * @param {HTMLElement|null} menu
+     * @param {number[]} desiredRates
+     * @param {Set<number>} nativeRateSet
+     * @returns {boolean}
+     */
+    function isRateMenuStructureSynced(menu, desiredRates, nativeRateSet) {
+        if (!menu) {
+            return false;
+        }
+
+        const currentMenuItems = getRateMenuItems(menu);
+        if (currentMenuItems.length !== desiredRates.length) {
+            return false;
+        }
+
+        return currentMenuItems.every((menuItem, index) => {
+            const itemRate = parseRateFromMenuItem(menuItem);
+            if (itemRate !== desiredRates[index]) {
+                return false;
+            }
+
+            if (nativeRateSet.has(itemRate)) {
+                return !isScriptCustomRateMenuItem(menuItem);
+            }
+
+            return isScriptCustomRateMenuItem(menuItem);
+        });
+    }
+
+    /**
      * 根据当前显示模式，计算倍速菜单真正的渲染顺序。
      *
      * 规则:
@@ -1703,80 +1956,107 @@
         }
 
         syncRateMenuUI(newRate);
-        state.restoreMark = {
-            videoKey: state.currentVideoKey,
-            videoElement: video
-        };
+        const hasPendingRestoreForCurrentVideo = state.pendingRestoreRate.videoElement === video;
+        if (hasPendingRestoreForCurrentVideo) {
+            /**
+             * 自动恢复期间，B 站播放器自身有可能先把倍速抖回 1x 或其他中间值。
+             * 这类 `ratechange` 不能写回历史记录，否则会把原本正确的历史倍速覆盖掉，
+             * 甚至直接把记录删空，导致“同一个视频刷新后恢复不稳定”。
+             *
+             * 只有当实际倍速终于到达本轮目标值时，才算这次恢复真正成功。
+             */
+            if (state.pendingRestoreRate.targetRate !== newRate) {
+                return;
+            }
 
-        if (newRate === DEFAULT_PLAYBACK_RATE) {
-            localStorage.removeItem(state.currentVideoKey);
-            state.lastSavedRate = null;
-            console.log('[B站倍速助手] 当前视频已恢复为 1x，已清除该视频的倍速记录');
+            state.restoreMark = {
+                videoKey: state.currentVideoKey,
+                videoElement: video
+            };
+            state.pendingRestoreRate = {
+                videoElement: null,
+                targetRate: null
+            };
+            console.log(`[B站倍速助手] 已按历史记录恢复当前视频倍速: ${newRate}x`);
             return;
         }
 
-        state.lastSavedRate = newRate;
-        localStorage.setItem(state.currentVideoKey, JSON.stringify({
-            rate: newRate,
-            timestamp: Date.now()
-        }));
-        console.log(`[B站倍速助手] 已记录当前视频倍速: ${newRate}x`);
+        persistRateForCurrentVideo(newRate, video);
     }
 
     /**
-     * 按当前配置完整重建倍速菜单.
-     * 这里不再把配置视为“额外倍速”，而是把它当成最终菜单的完整来源:
-     * - 配置里有的倍速就显示
-     * - 配置里没有的倍速就移除
+     * 保留原生菜单项，并按当前配置补充额外倍速项。
+     *
+     * 核心原则：
+     * - 原生项不删，尽量复用原生节点
+     * - 原生项继续保留 B 站自己的点击逻辑
+     * - 只有原生不存在的倍速，才由脚本追加菜单项
+     * - 最终只对 DOM 顺序做重排，不再整表拆掉重建
      *
      * @param {HTMLElement} menu
      */
     function ensureCustomRateItems(menu) {
-        const sortedRates = [...state.settings.customRates]
-            .map(({ rate }) => normalizeRate(rate))
-            .filter((rate) => rate !== null)
-            .sort((left, right) => left - right);
-        const desiredRates = buildMenuRenderRates(sortedRates);
+        const allExistingMenuItems = getRateMenuItems(menu);
+        const nativeMenuItems = getNativeRateMenuItems(menu);
+        const templateItem = nativeMenuItems[0] || allExistingMenuItems[0] || null;
+        const nativeItemMap = new Map();
 
-        const existingMenuItems = getRateMenuItems(menu);
-        const templateItem = existingMenuItems[0];
-
-        /**
-         * 先移除菜单中现有的所有倍速项，再完全按配置重建。
-         * 这样删掉原生倍速时，它们也会真正从菜单里消失。
-         */
-        existingMenuItems.forEach((menuItem) => {
-            menuItem.remove();
+        nativeMenuItems.forEach((menuItem) => {
+            const itemRate = parseRateFromMenuItem(menuItem);
+            if (itemRate !== null && !nativeItemMap.has(itemRate)) {
+                nativeItemMap.set(itemRate, menuItem);
+            }
         });
 
-        desiredRates.forEach((rate) => {
-            const newItem = document.createElement('li');
+        const desiredRates = buildDesiredMenuRates(menu);
+        const nativeRateSet = new Set(nativeItemMap.keys());
 
-            /**
-             * 尽量复制当前菜单项的 class 结构，只去掉可能存在的激活态类，
-             * 这样重建后的菜单仍能最大程度沿用 B 站原有样式.
-             */
-            newItem.className = templateItem
-                ? templateItem.className.replace(/\bbpx-state-active\b/g, '').trim()
-                : 'bpx-player-ctrl-playbackrate-menu-item';
-            newItem.dataset.value = String(rate);
-            newItem.dataset[CUSTOM_ITEM_MARK] = '1';
-            newItem.textContent = formatRateLabel(rate);
+        if (isRateMenuStructureSynced(menu, desiredRates, nativeRateSet)) {
+            return;
+        }
 
-            /**
-             * 点击自定义菜单项时，直接改 video.playbackRate.
-             * 原生菜单项本身也会触发播放器内部逻辑，而我们新增的菜单项没有这套内部接线，
-             * 所以这里必须手动接管点击行为.
-             */
-            newItem.addEventListener('click', () => {
-                const currentVideo = findVideoElement();
-                if (!currentVideo) {
-                    return;
-                }
+        const reusableCustomItemMap = new Map();
+        allExistingMenuItems.forEach((menuItem) => {
+            if (!isScriptCustomRateMenuItem(menuItem)) {
+                return;
+            }
 
-                applyPlaybackRateWithRetry(currentVideo, rate);
-            });
-            menu.appendChild(newItem);
+            const itemRate = parseRateFromMenuItem(menuItem);
+            if (
+                itemRate === null
+                || nativeRateSet.has(itemRate)
+                || reusableCustomItemMap.has(itemRate)
+            ) {
+                menuItem.remove();
+                return;
+            }
+
+            reusableCustomItemMap.set(itemRate, menuItem);
+        });
+
+        const desiredMenuItems = desiredRates.map((rate) => {
+            if (nativeItemMap.has(rate)) {
+                return nativeItemMap.get(rate);
+            }
+
+            return reusableCustomItemMap.get(rate) || createCustomRateMenuItem(templateItem, rate);
+        });
+
+        const usedCustomItems = new Set(
+            desiredMenuItems.filter(
+                (menuItem) => menuItem instanceof HTMLElement && isScriptCustomRateMenuItem(menuItem)
+            )
+        );
+        getRateMenuItems(menu).forEach((menuItem) => {
+            if (isScriptCustomRateMenuItem(menuItem) && !usedCustomItems.has(menuItem)) {
+                menuItem.remove();
+            }
+        });
+
+        desiredMenuItems.forEach((menuItem) => {
+            if (menuItem instanceof HTMLElement) {
+                menu.appendChild(menuItem);
+            }
         });
     }
 
@@ -1917,7 +2197,18 @@
             return false;
         }
 
-        applyPlaybackRateWithRetry(video, targetRate);
+        /**
+         * “增减倍速”是按 0.1x 连续细调的链路。
+         * 这里如果在命中 0.5 / 1.0 / 1.5 / 2.0 等原生值时还强行走“模拟点击原生菜单项”，
+         * 一旦页面当前没有真正接住这次 synthetic click，就会表现成“卡在 1.4 上不去 1.5”
+         * 或“从 1.1 下不来 1.0”。
+         *
+         * 因此这里明确禁用“优先触发原生项”，统一直接写 playbackRate，
+         * 保证 0.1x 步进链路连续、可预测、不丢档。
+         */
+        applyPlaybackRateFromUserAction(video, targetRate, {
+            preferNativeMenuItem: false
+        });
         showCenterRateHint(targetRate);
         console.log(`[B站倍速助手] 已通过增减快捷键调整到 ${targetRate}x`);
         return true;
@@ -2175,7 +2466,7 @@
             event.preventDefault();
             event.stopPropagation();
             event.stopImmediatePropagation();
-            applyPlaybackRateWithRetry(video, targetRate);
+            applyPlaybackRateFromUserAction(video, targetRate);
             showCenterRateHint(targetRate);
             console.log(`[B站倍速助手] 已通过快捷键切换到 ${targetRate}x`);
         };
@@ -2202,7 +2493,7 @@
 
     /**
      * 只有在当前视频存在历史记录时才自动恢复倍速.
-     * 如果没有历史记录，就完全不干预当前播放器的原生继承行为.
+     * 如果没有历史记录，就不主动改动当前播放器倍速。
      *
      * @param {HTMLVideoElement} video
      */
@@ -2212,7 +2503,7 @@
                 videoKey: state.currentVideoKey,
                 videoElement: video
             };
-            console.log('[B站倍速助手] 当前视频没有历史倍速记录，保持播放器当前倍速不变');
+            console.log('[B站倍速助手] 当前视频没有历史倍速记录，不主动改动当前播放器倍速');
             return;
         }
 
@@ -2229,6 +2520,32 @@
         }
 
         /**
+         * 如果当前真实倍速已经等于历史值，就直接视为恢复完成。
+         * 这能避免页面已经恢复成功，但后续又因为 DOM 轻微波动而重复触发恢复流程。
+         */
+        if (normalizeRate(video.playbackRate) === targetRate) {
+            state.pendingRestoreRate = {
+                videoElement: null,
+                targetRate: null
+            };
+            state.restoreMark = {
+                videoKey: state.currentVideoKey,
+                videoElement: video
+            };
+            return;
+        }
+
+        const isSameRestoreStillApplying = (
+            state.pendingRestoreRate.videoElement === video
+            && state.pendingRestoreRate.targetRate === targetRate
+            && state.pendingPlaybackRateApply.videoElement === video
+            && state.pendingPlaybackRateApply.targetRate === targetRate
+        );
+        if (isSameRestoreStillApplying) {
+            return;
+        }
+
+        /**
          * 这里不再要求“历史倍速必须存在于当前菜单配置中”。
          * 因为新增了 0.1x 步长的增减快捷键后，用户完全可能把视频调到 1.3x / 1.4x / 1.6x
          * 这类不在菜单里的倍速。如果仍然沿用旧规则，这些倍速就会被记住但无法恢复。
@@ -2239,13 +2556,12 @@
          * 直接设置 video.playbackRate，由 ratechange 监听器负责统一做 UI 同步和记录更新。
          * 这样逻辑比“模拟鼠标点击播放器菜单”更简单，也更不容易被页面结构细节击穿。
          */
-        applyPlaybackRateWithRetry(video, targetRate);
-
-        state.restoreMark = {
-            videoKey: state.currentVideoKey,
-            videoElement: video
+        state.pendingRestoreRate = {
+            videoElement: video,
+            targetRate
         };
-        console.log(`[B站倍速助手] 已恢复当前视频倍速为 ${targetRate}x`);
+        applyPlaybackRateWithRetry(video, targetRate);
+        console.log(`[B站倍速助手] 正在尝试恢复当前视频倍速为 ${targetRate}x`);
     }
 
     /**
@@ -2302,6 +2618,10 @@
         }
 
         clearPendingPlaybackRateApply();
+        state.pendingRestoreRate = {
+            videoElement: null,
+            targetRate: null
+        };
         state.currentVideoKey = nextVideoKey;
         state.lastSavedRate = loadSavedRate(nextVideoKey);
         state.restoreMark = {
