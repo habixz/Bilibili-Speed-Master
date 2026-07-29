@@ -42,6 +42,9 @@
     const CENTER_RATE_HINT_HIDE_DELAY = 650;
     const CENTER_RATE_HINT_REMOVE_DELAY = 900;
     const RATE_ADJUST_REVERSE_RESET_WINDOW_MS = 600;
+    const HREF_WATCH_ACTIVE_DELAY = 250;
+    const HREF_WATCH_IDLE_DELAY = 1000;
+    const HREF_WATCH_HIDDEN_DELAY = 3000;
     const CURRENT_CONFIG_VERSION = 4;
 
     /**
@@ -165,6 +168,9 @@
         lastRateAdjustAction: '',
         lastRateAdjustTriggeredAt: 0,
         multiShortcutResetTriggered: false,
+        hrefWatchTimer: 0,
+        hrefWatchLastObserved: location.href,
+        hrefWatchIdleTicks: 0,
         restoreMark: {
             videoContextId: '',
             videoElement: null
@@ -1481,9 +1487,16 @@
         } catch (error) {
             /**
              * 兼容你旧版脚本可能留下的纯数字字符串记录.
-             * 这里读得出来就继续用，后续一旦再次保存就会被自动升级成 JSON 结构.
+             * 这里一旦读得出来，就立即升级成带时间戳的新格式，
+             * 避免“本次会话先读取旧值，随后 cleanup 又把旧记录删掉”的时序分裂。
              */
             const legacyRate = normalizeRate(rawValue);
+            if (legacyRate !== null) {
+                localStorage.setItem(videoKey, JSON.stringify({
+                    rate: legacyRate,
+                    timestamp: Date.now()
+                }));
+            }
             return legacyRate;
         }
     }
@@ -2101,15 +2114,34 @@
         const sortedRates = getConfiguredRates().sort((left, right) => left - right);
         const desiredRates = buildMenuRenderRates(sortedRates);
         const existingMenuItems = getRateMenuItems(menu);
+
+        /**
+         * bootstrap 和 DOM 观察器都会反复进入这里。
+         * 如果菜单当前已经和目标结构完全一致，就直接短路返回，
+         * 避免整表 remove + append 把自己再次触发进观察器回调。
+         */
+        const isMenuAlreadyInSync = (
+            existingMenuItems.length === desiredRates.length
+            && existingMenuItems.every((menuItem, index) => (
+                menuItem.dataset[CUSTOM_ITEM_MARK] === '1'
+                && parseRateFromMenuItem(menuItem) === desiredRates[index]
+            ))
+        );
+        if (isMenuAlreadyInSync) {
+            return;
+        }
+
         const templateItem = existingMenuItems[0] || null;
+        const fragment = document.createDocumentFragment();
 
         existingMenuItems.forEach((menuItem) => {
             menuItem.remove();
         });
 
         desiredRates.forEach((rate) => {
-            menu.appendChild(createCustomRateMenuItem(templateItem, rate));
+            fragment.appendChild(createCustomRateMenuItem(templateItem, rate));
         });
+        menu.appendChild(fragment);
     }
 
     /**
@@ -2973,45 +3005,74 @@
     }
 
     /**
+     * 用可退避的 URL 观察替代永久高频 setInterval。
+     * 页面刚发生站内跳转后保持高频检测；稳定一段时间后自动降频；
+     * 页面进入后台时再进一步降低频率，减少常驻开销。
+     *
+     * @param {number} delay
+     */
+    function scheduleHrefWatch(delay) {
+        clearTimeout(state.hrefWatchTimer);
+        state.hrefWatchTimer = window.setTimeout(() => {
+            const currentHref = location.href;
+            if (currentHref !== state.hrefWatchLastObserved) {
+                state.hrefWatchLastObserved = currentHref;
+                state.hrefWatchIdleTicks = 0;
+                refreshVideoContext();
+                scheduleHrefWatch(HREF_WATCH_ACTIVE_DELAY);
+                return;
+            }
+
+            state.hrefWatchIdleTicks += 1;
+            const nextDelay = document.hidden
+                ? HREF_WATCH_HIDDEN_DELAY
+                : (state.hrefWatchIdleTicks >= 4 ? HREF_WATCH_IDLE_DELAY : HREF_WATCH_ACTIVE_DELAY);
+            scheduleHrefWatch(nextDelay);
+        }, delay);
+    }
+
+    /**
      * 监听 history 和 popstate，适配 B 站站内无刷跳转.
      */
     function installRouteChangeListener() {
         const rawPushState = history.pushState;
         const rawReplaceState = history.replaceState;
-        let lastObservedHref = location.href;
 
         history.pushState = function (...args) {
             const result = rawPushState.apply(this, args);
-            lastObservedHref = location.href;
+            state.hrefWatchLastObserved = location.href;
+            state.hrefWatchIdleTicks = 0;
             setTimeout(refreshVideoContext, 120);
+            scheduleHrefWatch(HREF_WATCH_ACTIVE_DELAY);
             return result;
         };
 
         history.replaceState = function (...args) {
             const result = rawReplaceState.apply(this, args);
-            lastObservedHref = location.href;
+            state.hrefWatchLastObserved = location.href;
+            state.hrefWatchIdleTicks = 0;
             setTimeout(refreshVideoContext, 120);
+            scheduleHrefWatch(HREF_WATCH_ACTIVE_DELAY);
             return result;
         };
 
         window.addEventListener('popstate', () => {
-            lastObservedHref = location.href;
+            state.hrefWatchLastObserved = location.href;
+            state.hrefWatchIdleTicks = 0;
             setTimeout(refreshVideoContext, 120);
+            scheduleHrefWatch(HREF_WATCH_ACTIVE_DELAY);
         });
 
         /**
          * 有些合集内切换不会可靠触发 pushState / replaceState，
          * 但地址栏里的 `p=` 确实会变化。
-         * 这里补一个轻量轮询，专门兜住这种“URL 变了，但页面没有显式路由事件”的场景。
+         * 这里补一个可退避的轮询兜底，专门处理这种“URL 变了，但页面没有显式路由事件”的场景。
          */
-        window.setInterval(() => {
-            if (location.href === lastObservedHref) {
-                return;
-            }
-
-            lastObservedHref = location.href;
-            refreshVideoContext();
-        }, 250);
+        scheduleHrefWatch(HREF_WATCH_ACTIVE_DELAY);
+        document.addEventListener('visibilitychange', () => {
+            state.hrefWatchIdleTicks = 0;
+            scheduleHrefWatch(document.hidden ? HREF_WATCH_HIDDEN_DELAY : HREF_WATCH_ACTIVE_DELAY);
+        });
     }
 
     /**
