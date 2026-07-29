@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站倍速助手
 // @namespace    /DBI/bilibili-speed-assistant
-// @version      1.1.1
-// @description  合并自定义倍速(支持两栏显示倍速菜单); 按视频记忆倍速(兼容 B 站站内跳转); 新增增减倍速快捷键
+// @version      1.2.0
+// @description  完全自制倍速列表(支持两栏显示倍速菜单); 按视频/合集记忆倍速(兼容 B 站站内跳转); 新增增减倍速快捷键
 // @author       habixz
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/watchlater*
@@ -41,7 +41,8 @@
     const PLAYBACK_RATE_APPLY_RETRY_DELAYS = [0, 120, 320, 700, 1200, 1800];
     const CENTER_RATE_HINT_HIDE_DELAY = 650;
     const CENTER_RATE_HINT_REMOVE_DELAY = 900;
-    const CURRENT_CONFIG_VERSION = 3;
+    const RATE_ADJUST_REVERSE_RESET_WINDOW_MS = 600;
+    const CURRENT_CONFIG_VERSION = 4;
 
     /**
      * 默认倍速和快捷键列表.
@@ -70,19 +71,6 @@
         increase: '',
         decrease: ''
     };
-
-    /**
-     * 旧版脚本里原本就是 B 站自带的基础倍速。
-     * 当把旧“额外倍速”配置迁移到新“完整倍速菜单”语义时，需要把这些基础项补回来。
-     */
-    const LEGACY_BUILTIN_RATES = [
-        { rate: 0.5, shortcut: '' },
-        { rate: 0.75, shortcut: '' },
-        { rate: 1, shortcut: '' },
-        { rate: 1.25, shortcut: '' },
-        { rate: 1.5, shortcut: '' },
-        { rate: 2, shortcut: '' }
-    ];
 
     /**
      * 尽量把可能出现的播放器结构都兜住.
@@ -115,6 +103,29 @@
             '.bpx-player-container',
             '.bpx-player-video-area',
             '.bpx-player-video-wrap'
+        ],
+        collectionHeaderTitle: [
+            '.video-pod__header .title[title="视频选集"]',
+            '.video-pod__header .title',
+            '[title="视频选集"]'
+        ],
+        collectionRoot: [
+            '.video-pod',
+            '[class*="video-pod"]',
+            '.rcmd-tab'
+        ],
+        collectionItem: [
+            '.video-pod__item[data-key]',
+            '[class*="video-pod__item"][data-key]',
+            '.simple-base-item[data-key]'
+        ],
+        collectionItemTitle: [
+            '.title-txt',
+            '.title'
+        ],
+        collectionCount: [
+            '.video-pod__header .amt',
+            '.amt'
         ]
     };
 
@@ -125,6 +136,7 @@
     const state = {
         settings: loadSettings(),
         currentVideoKey: '',
+        currentVideoContextId: '',
         lastSavedRate: null,
         currentVideo: null,
         bootstrapTimer: null,
@@ -138,6 +150,7 @@
             videoElement: null,
             targetRate: null
         },
+        waitingForInitialRestore: false,
         centerRateHintHost: null,
         centerRateHintElement: null,
         centerRateHintHideTimer: 0,
@@ -149,8 +162,11 @@
         rateAdjustHoldAction: '',
         rateAdjustHoldShortcut: '',
         rateAdjustHoldStartedAt: 0,
+        lastRateAdjustAction: '',
+        lastRateAdjustTriggeredAt: 0,
+        multiShortcutResetTriggered: false,
         restoreMark: {
-            videoKey: '',
+            videoContextId: '',
             videoElement: null
         }
     };
@@ -163,6 +179,7 @@
      * 4. 立即尝试启动一次播放器接管逻辑.
      */
     state.currentVideoKey = buildCurrentVideoKey();
+    state.currentVideoContextId = buildCurrentVideoContextId();
     state.lastSavedRate = loadSavedRate(state.currentVideoKey);
     registerMenuCommands();
     installShortcutListener();
@@ -173,21 +190,18 @@
 
     /**
      * 读取脚本设置.
-     * 自定义倍速用 GM 存储; 按视频记忆倍速继续用 localStorage，便于按页面隔离.
+     * 自定义倍速用 GM 存储; 按视频/合集记忆倍速继续用 localStorage，便于按页面隔离.
      */
     function loadSettings() {
         const storedConfigVersion = Number(GM_getValue(SETTINGS_KEY_CONFIG_VERSION, 0));
-        let normalizedRates = normalizeRateConfigList(GM_getValue(SETTINGS_KEY_RATES, DEFAULT_CUSTOM_RATES));
+        const normalizedRates = normalizeRateConfigList(GM_getValue(SETTINGS_KEY_RATES, DEFAULT_CUSTOM_RATES));
 
         /**
-         * 兼容旧版本“这里只存额外倍速”的配置语义。
-         * 首次升级到新版时，把 B 站原生基础倍速补进配置里，再写回存储，避免用户升级后菜单突然缺项。
+         * 当前版本重新回到“完整自制倍速列表”语义。
+         * 这里不再自动把网页原生档位补进配置里，而是只把已有配置规整后写回，
+         * 让菜单最终完全由脚本配置决定。
          */
         if (storedConfigVersion < CURRENT_CONFIG_VERSION) {
-            normalizedRates = normalizeRateConfigList([
-                ...LEGACY_BUILTIN_RATES,
-                ...normalizedRates
-            ]);
             GM_setValue(SETTINGS_KEY_RATES, normalizedRates);
             GM_setValue(SETTINGS_KEY_CONFIG_VERSION, CURRENT_CONFIG_VERSION);
         }
@@ -570,12 +584,9 @@
      * 这里保持和旧脚本相近的交互方式，避免你后续维护时还得适应一套全新的设置逻辑.
      */
     function registerMenuCommands() {
-        GM_registerMenuCommand('编辑全部倍数和快捷键', editCustomRatesAndShortcuts);
+        GM_registerMenuCommand('编辑全部倍数(快捷键)', editCustomRatesAndShortcuts);
         GM_registerMenuCommand('设置增减倍速快捷键', editRateAdjustShortcuts);
-        GM_registerMenuCommand(
-            `${state.settings.twoCols ? '[✔️已启用]' : '[❌已禁用]'} 将倍数列表分为两栏显示`,
-            toggleTwoColumnMenu
-        );
+        GM_registerMenuCommand(state.settings.twoCols ? '改为单栏倍速列表' : '改为两栏倍速列表', toggleTwoColumnMenu);
     }
 
     /**
@@ -901,7 +912,7 @@
 
         const title = document.createElement('h3');
         title.className = 'bsa-rate-dialog-title';
-        title.textContent = '编辑脚本倍数和快捷键';
+        title.textContent = '编辑全部倍数和快捷键';
         dialog.appendChild(title);
 
         const description = document.createElement('p');
@@ -909,10 +920,10 @@
         description.textContent = '格式: 倍数1, 倍数2, 倍数3(快捷键)\n'
             + '示例: 0.5, 1, 1.5, 2, 3(ctrl+shift+7)\n'
             + '说明:\n'
-            + '- 网页原生自带的倍速项会保留；这里主要控制脚本补充的倍速和对应快捷键\n'
-            + '- 新增的额外倍速会补进菜单；删掉后只会移除脚本补充项，不会删除网页原生档位\n'
-            + '- 留空表示不额外补充任何脚本倍速\n'
-            + '- 点击“重置”会把脚本倍速列表恢复为网页原始默认档';
+            + '- 当前倍速菜单完全由这里的列表决定\n'
+            + '- 添加某个倍速后，页面里会新增对应项；删掉后，对应项会直接消失\n'
+            + '- 留空表示菜单里不显示任何脚本倍速\n'
+            + '- 点击“重置”会恢复成脚本内置默认倍速列表';
         dialog.appendChild(description);
 
         const textarea = document.createElement('textarea');
@@ -968,20 +979,20 @@
             closeRateConfigDialog();
             saveRateConfig(
                 parsedResult.value,
-                '已保存，当前页面会立即按你的配置同步菜单：原生项会保留，额外项会按配置补充。'
+                '已保存，当前页面会立即按你的完整倍速列表重建菜单。'
             );
         });
 
         resetButton.addEventListener('click', () => {
-            const shouldReset = confirm('确定要把脚本倍速列表重置为网页原始默认档吗？这会覆盖你当前脚本配置。');
+            const shouldReset = confirm('确定要重置为脚本内置默认倍速列表吗？这会覆盖你当前自定义的倍速配置。');
             if (!shouldReset) {
                 return;
             }
 
             closeRateConfigDialog();
             saveRateConfig(
-                LEGACY_BUILTIN_RATES,
-                '已重置脚本倍速列表，当前页面会立即按默认档同步菜单。'
+                DEFAULT_CUSTOM_RATES,
+                '已重置为脚本默认倍速列表，当前页面会立即重建倍速菜单。'
             );
         });
 
@@ -1218,17 +1229,29 @@
         state.settings.twoCols = !state.settings.twoCols;
         GM_setValue(SETTINGS_KEY_TWO_COLS, state.settings.twoCols);
         scheduleBootstrap(0);
-        alert(`${state.settings.twoCols ? '已启用' : '已禁用'}两栏显示，当前页面已尝试立即应用.`);
+        alert(`当前已切换为${state.settings.twoCols ? '两栏倍速列表' : '单栏倍速列表'}，当前页面已尝试立即应用。`);
     }
 
     /**
-     * 根据当前 URL 构造“视频唯一键”.
-     * 这里不直接整段使用完整 URL，而是只保留真正影响播放器内容的路径和少量关键参数，
-     * 从而规避 spm / from_source 等追踪参数导致同一视频生成多个不同缓存键的问题.
+     * 规整要拼进缓存键里的文本，避免换行、连续空格等页面噪音把同一合集拆成多个键。
+     *
+     * @param {string|null|undefined} text
+     * @returns {string}
+     */
+    function normalizeTextForStorageKey(text) {
+        return String(text || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 80);
+    }
+
+    /**
+     * 根据当前 URL 构造“单视频唯一键”。
+     * 当页面没有检测到合集列表时，继续沿用这个粒度，保证不同普通视频彼此隔离。
      *
      * @returns {string}
      */
-    function buildCurrentVideoKey() {
+    function buildStandaloneVideoKey() {
         const url = new URL(location.href);
         const importantParams = ['p', 'bvid', 'avid', 'cid', 'oid', 'ep_id', 'season_id', 'business'];
         const normalizedSearch = importantParams
@@ -1238,6 +1261,197 @@
             .join('&');
 
         return `${STORAGE_PREFIX}:${url.pathname}${normalizedSearch ? `?${normalizedSearch}` : ''}`;
+    }
+
+    /**
+     * 构造“当前具体这一个视频内容”的上下文标识。
+     *
+     * 和 `buildCurrentVideoKey` 的区别是：
+     * - `buildCurrentVideoKey` 用来决定“历史倍速存到哪一份”
+     * - 这里用来决定“当前是不是已经切到另一条分 P / 另一集内容了”
+     *
+     * 因此这里会保留 `p`、`ep_id`、`cid` 等能区分具体视频内容的字段，
+     * 用来修复“合集内切换但视频元素复用，导致恢复逻辑不重新执行”的问题。
+     *
+     * @returns {string}
+     */
+    function buildCurrentVideoContextId() {
+        return buildStandaloneVideoKey();
+    }
+
+    /**
+     * 找到页面里的“视频选集”区域根节点。
+     *
+     * 这里不用只盯死某一个 class，而是先确认标题确实是“视频选集”，
+     * 再向上找合集容器。这样即使 B 站以后小改一层壳，也更容易继续命中。
+     *
+     * @returns {HTMLElement|null}
+     */
+    function findCollectionListRoot() {
+        for (const selector of SELECTORS.collectionHeaderTitle) {
+            const matchedElements = document.querySelectorAll(selector);
+            for (const matchedElement of matchedElements) {
+                if (!(matchedElement instanceof HTMLElement)) {
+                    continue;
+                }
+
+                const titleText = normalizeTextForStorageKey(
+                    matchedElement.getAttribute('title') || matchedElement.textContent
+                );
+                if (titleText !== '视频选集') {
+                    continue;
+                }
+
+                for (const rootSelector of SELECTORS.collectionRoot) {
+                    const collectionRoot = matchedElement.closest(rootSelector);
+                    if (collectionRoot instanceof HTMLElement) {
+                        return collectionRoot;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * 给合集页面做一个“页面家族”标签。
+     * 如果后面拿不到足够稳定的合集特征，就退一步按这个家族共享倍速，
+     * 这样至少能做到“合集页之间继承”，不会退回到完全按单视频隔离。
+     *
+     * @returns {string}
+     */
+    function getCollectionPageFamily() {
+        const { pathname } = location;
+        if (pathname.startsWith('/bangumi/')) {
+            return 'bangumi';
+        }
+        if (pathname.startsWith('/festival/')) {
+            return 'festival';
+        }
+        if (pathname.startsWith('/list/watchlater')) {
+            return 'watchlater';
+        }
+        if (pathname.startsWith('/list/')) {
+            return 'list';
+        }
+        return 'video';
+    }
+
+    /**
+     * 对于普通 BV 视频页，只要页面里存在“视频选集”区域，
+     * 就可以直接把 `p` 视为同一合集内部的分 P 序号。
+     *
+     * 也就是说：
+     * - `.../video/BVxxxx`
+     * - `.../video/BVxxxx?p=2`
+     * - `.../video/BVxxxx?p=19`
+     * 都归到同一个合集作用域里
+     *
+     * 这比依赖 DOM 列表内容去拼指纹更直接，也更稳定。
+     *
+     * @returns {string}
+     */
+    function buildCollectionScopeKeyFromUrl() {
+        const url = new URL(location.href);
+        if (!url.pathname.startsWith('/video/')) {
+            return '';
+        }
+
+        const importantParams = ['bvid', 'avid', 'season_id', 'business'];
+        const normalizedSearch = importantParams
+            .filter((key) => url.searchParams.has(key))
+            .sort()
+            .map((key) => `${key}=${url.searchParams.get(key)}`)
+            .join('&');
+
+        return `collection:url:${url.pathname}${normalizedSearch ? `?${normalizedSearch}` : ''}`;
+    }
+
+    /**
+     * 从“视频选集”区域提取尽量稳定的合集指纹。
+     *
+     * 优先使用列表项的 `data-key`，因为它通常比标题文本更稳定；
+     * 如果拿不到，再退到“选集总数 + 前几个标题样本”。
+     * 最后如果页面只露出了“这里有选集区域”但拿不到更多特征，
+     * 就退化成“同类合集页面共用一个键”。
+     *
+     * @returns {string}
+     */
+    function buildCollectionScopeKey() {
+        const collectionScopeKeyFromUrl = buildCollectionScopeKeyFromUrl();
+        if (collectionScopeKeyFromUrl) {
+            return collectionScopeKeyFromUrl;
+        }
+
+        const collectionRoot = findCollectionListRoot();
+        if (!collectionRoot) {
+            return '';
+        }
+
+        const pageFamily = getCollectionPageFamily();
+        let countText = '';
+        for (const selector of SELECTORS.collectionCount) {
+            const countElement = collectionRoot.querySelector(selector);
+            if (countElement instanceof HTMLElement) {
+                countText = normalizeTextForStorageKey(countElement.textContent);
+                break;
+            }
+        }
+        const itemNodes = SELECTORS.collectionItem
+            .flatMap((selector) => [...collectionRoot.querySelectorAll(selector)])
+            .filter((element, index, array) => element instanceof HTMLElement && array.indexOf(element) === index)
+            .slice(0, 12);
+        const itemKeys = itemNodes
+            .map((itemNode) => normalizeTextForStorageKey(itemNode.dataset.key))
+            .filter(Boolean);
+
+        if (itemKeys.length > 0) {
+            return `collection:${pageFamily}:keys:${countText}:${itemKeys.join(',')}`;
+        }
+
+        const titleSamples = itemNodes
+            .map((itemNode) => {
+                for (const selector of SELECTORS.collectionItemTitle) {
+                    const titleNode = itemNode.querySelector(selector);
+                    if (titleNode instanceof HTMLElement) {
+                        return normalizeTextForStorageKey(titleNode.textContent);
+                    }
+                }
+                return '';
+            })
+            .filter(Boolean)
+            .slice(0, 6);
+
+        if (titleSamples.length > 0) {
+            return `collection:${pageFamily}:titles:${countText}:${titleSamples.join('|')}`;
+        }
+
+        return `collection:${pageFamily}:fallback`;
+    }
+
+    /**
+     * 根据当前页面上下文构造缓存键。
+     *
+     * 规则改成：
+     * - 没有“视频选集”区域时：按单视频记忆
+     * - 有“视频选集”区域时：优先按合集指纹记忆
+     * - 如果合集指纹提取不完整：退一步让同类合集页共享倍速
+     *
+     * 这样就能尽量满足：
+     * - 同一个视频刷新后倍速不变
+     * - 不同普通视频互不干扰
+     * - 合集内不同视频尽量继承倍速
+     *
+     * @returns {string}
+     */
+    function buildCurrentVideoKey() {
+        const collectionScopeKey = buildCollectionScopeKey();
+        if (collectionScopeKey) {
+            return `${STORAGE_PREFIX}:${collectionScopeKey}`;
+        }
+
+        return buildStandaloneVideoKey();
     }
 
     /**
@@ -1625,6 +1839,20 @@
      * 这在站内跳转但 video 节点复用的场景下很关键.
      */
     function handleVideoReload() {
+        /**
+         * 合集内切换分 P 时，B 站经常会复用同一个 video 元素，只是替换媒体源。
+         * 如果这里不把“本轮已经恢复过”的标记清掉，后续 bootstrap 可能会误以为
+         * 当前这条新视频已经恢复完成，从而跳过真正需要的倍速恢复。
+         */
+        state.restoreMark = {
+            videoContextId: '',
+            videoElement: null
+        };
+        state.pendingRestoreRate = {
+            videoElement: null,
+            targetRate: null
+        };
+        state.waitingForInitialRestore = true;
         scheduleBootstrap(80);
     }
 
@@ -1674,7 +1902,7 @@
         }
 
         state.restoreMark = {
-            videoKey: state.currentVideoKey,
+            videoContextId: state.currentVideoContextId,
             videoElement: video instanceof HTMLVideoElement ? video : null
         };
 
@@ -1696,60 +1924,26 @@
     /**
      * 处理“脚本主动发起”的倍速变更。
      *
+     * 当前版本重新回到“完全自制倍速列表”：
+     * - 菜单项全部由脚本自己生成
+     * - 点击菜单或触发快捷键时，统一直接写 `video.playbackRate`
+     * - 这样菜单语义最简单，也不会再混入原生菜单项的额外行为
+     *
      * 和“自动恢复历史倍速”区分开来的原因是：
-     * - 用户主动调整时，要立即刷新当前视频的 1 天有效期记录
+     * - 用户主动调整时，要立即刷新当前视频/合集的 1 天有效期记录
      * - 自动恢复历史时，只需要读记录并应用，不应该把“恢复动作”本身再视为一次新的用户操作
      *
      * @param {HTMLVideoElement|null} video
      * @param {number|string} targetRate
-     * @param {{ preferNativeMenuItem?: boolean }} [options]
      */
-    function applyPlaybackRateFromUserAction(video, targetRate, options = {}) {
+    function applyPlaybackRateFromUserAction(video, targetRate) {
         const normalizedTargetRate = normalizeRate(targetRate);
         if (!(video instanceof HTMLVideoElement) || normalizedTargetRate === null) {
             return;
         }
 
-        const { preferNativeMenuItem = true } = options;
-
-        /**
-         * 对于 B 站原生本来就存在的倍速，优先尝试触发原生菜单项。
-         * 这样能尽量保留播放器内部原生逻辑，例如合集内倍速继承等行为。
-         *
-         * 但这里不能再沿用“只要找到了原生项就视为成功”的旧思路：
-         * synthetic click 可能被页面接住，也可能没有真正把播放器切到目标倍速。
-         * 因此只有在触发后确认当前 video.playbackRate 已经到达目标值时，才算原生切换成功；
-         * 否则必须回退到脚本自己直接设置 playbackRate。
-         */
-        if (preferNativeMenuItem && triggerNativeRateMenuItem(video, normalizedTargetRate)) {
-            persistRateForCurrentVideo(normalizedTargetRate, video);
-            syncRateMenuUI(normalizedTargetRate);
-            return;
-        }
-
         applyPlaybackRateWithRetry(video, normalizedTargetRate);
         persistRateForCurrentVideo(normalizedTargetRate, video);
-    }
-
-    /**
-     * 判断某个菜单项是否由脚本创建。
-     *
-     * @param {HTMLElement} menuItem
-     * @returns {boolean}
-     */
-    function isScriptCustomRateMenuItem(menuItem) {
-        return menuItem.dataset[CUSTOM_ITEM_MARK] === '1';
-    }
-
-    /**
-     * 只获取 B 站原生菜单项。
-     * 这些节点必须尽量保留，因为它们背后可能挂着播放器自己的内部逻辑。
-     *
-     * @param {HTMLElement|null} menu
-     * @returns {HTMLElement[]}
-     */
-    function getNativeRateMenuItems(menu) {
-        return getRateMenuItems(menu).filter((menuItem) => !isScriptCustomRateMenuItem(menuItem));
     }
 
     /**
@@ -1764,78 +1958,10 @@
     }
 
     /**
-     * 把“原生已有倍速”和“脚本配置倍速”做并集，再计算最终渲染顺序。
+     * 创建一个由脚本完全控制的倍速菜单项。
      *
-     * 这里改成并集，而不是再把原生菜单整套删掉重建，目的是：
-     * - 原生项继续保留
-     * - 原生项继续走 B 站原本的点击逻辑
-     * - 脚本只额外补充菜单里原本不存在的倍速项
-     *
-     * @param {HTMLElement|null} menu
-     * @returns {number[]}
-     */
-    function buildDesiredMenuRates(menu) {
-        const nativeRates = getNativeRateMenuItems(menu)
-            .map((menuItem) => parseRateFromMenuItem(menuItem))
-            .filter((rate) => rate !== null);
-        const configuredRates = getConfiguredRates();
-        const mergedRates = [...new Set([...nativeRates, ...configuredRates])]
-            .sort((left, right) => left - right);
-        return buildMenuRenderRates(mergedRates);
-    }
-
-    /**
-     * 按倍速查找当前菜单里的原生项。
-     *
-     * @param {HTMLElement|null} menu
-     * @param {number|string} rate
-     * @returns {HTMLElement|null}
-     */
-    function findNativeRateMenuItemByRate(menu, rate) {
-        const normalizedRate = normalizeRate(rate);
-        if (normalizedRate === null) {
-            return null;
-        }
-
-        return getNativeRateMenuItems(menu)
-            .find((menuItem) => parseRateFromMenuItem(menuItem) === normalizedRate) || null;
-    }
-
-    /**
-     * 尝试触发 B 站原生菜单项，并立即确认是否真的切到了目标倍速。
-     * 只有确认成功时才返回 true，避免把“找到了原生项”误判成“切换已经成功”。
-     *
-     * @param {HTMLVideoElement|null} video
-     * @param {number|string} rate
-     * @returns {boolean}
-     */
-    function triggerNativeRateMenuItem(video, rate) {
-        if (!(video instanceof HTMLVideoElement)) {
-            return false;
-        }
-
-        const normalizedRate = normalizeRate(rate);
-        if (normalizedRate === null) {
-            return false;
-        }
-
-        const menu = findPlaybackRateMenu();
-        const nativeMenuItem = findNativeRateMenuItemByRate(menu, normalizedRate);
-        if (!nativeMenuItem) {
-            return false;
-        }
-
-        nativeMenuItem.dispatchEvent(new MouseEvent('click', {
-            bubbles: true,
-            cancelable: true,
-            view: window
-        }));
-        return normalizeRate(video.playbackRate) === normalizedRate;
-    }
-
-    /**
-     * 创建一个脚本额外补充的倍速菜单项。
-     * 只有当前目标倍速不在原生菜单里时，才会创建这种节点。
+     * 这里会直接拦截点击，并走脚本自己的倍速设置逻辑，
+     * 这样菜单里每个档位的行为都一致，不再区分“原生项”和“脚本项”。
      *
      * @param {HTMLElement|null} templateItem
      * @param {number} rate
@@ -1869,39 +1995,6 @@
         });
 
         return newItem;
-    }
-
-    /**
-     * 判断当前菜单结构是否已经与“原生项保留 + 脚本项追加”后的目标状态一致。
-     * 一致时直接复用，避免刷新阶段反复改 DOM 导致菜单难点。
-     *
-     * @param {HTMLElement|null} menu
-     * @param {number[]} desiredRates
-     * @param {Set<number>} nativeRateSet
-     * @returns {boolean}
-     */
-    function isRateMenuStructureSynced(menu, desiredRates, nativeRateSet) {
-        if (!menu) {
-            return false;
-        }
-
-        const currentMenuItems = getRateMenuItems(menu);
-        if (currentMenuItems.length !== desiredRates.length) {
-            return false;
-        }
-
-        return currentMenuItems.every((menuItem, index) => {
-            const itemRate = parseRateFromMenuItem(menuItem);
-            if (itemRate !== desiredRates[index]) {
-                return false;
-            }
-
-            if (nativeRateSet.has(itemRate)) {
-                return !isScriptCustomRateMenuItem(menuItem);
-            }
-
-            return isScriptCustomRateMenuItem(menuItem);
-        });
     }
 
     /**
@@ -1970,14 +2063,24 @@
             }
 
             state.restoreMark = {
-                videoKey: state.currentVideoKey,
+                videoContextId: state.currentVideoContextId,
                 videoElement: video
             };
             state.pendingRestoreRate = {
                 videoElement: null,
                 targetRate: null
             };
+            state.waitingForInitialRestore = false;
             console.log(`[B站倍速助手] 已按历史记录恢复当前视频倍速: ${newRate}x`);
+            return;
+        }
+
+        /**
+         * 刚切到新分 P / 新视频上下文时，播放器常会先自己抖出一个 1x 或其他临时值。
+         * 在脚本真正完成本轮恢复前，这些中间 `ratechange` 不能写回历史，
+         * 否则共享的合集倍速会被错误覆盖。
+         */
+        if (state.waitingForInitialRestore) {
             return;
         }
 
@@ -1985,78 +2088,27 @@
     }
 
     /**
-     * 保留原生菜单项，并按当前配置补充额外倍速项。
+     * 按当前配置完整重建倍速菜单。
      *
-     * 核心原则：
-     * - 原生项不删，尽量复用原生节点
-     * - 原生项继续保留 B 站自己的点击逻辑
-     * - 只有原生不存在的倍速，才由脚本追加菜单项
-     * - 最终只对 DOM 顺序做重排，不再整表拆掉重建
+     * 当前版本不再保留网页原生倍速项：
+     * - 配置里有的倍速就显示
+     * - 配置里没有的倍速就不显示
+     * - 菜单里所有档位都由脚本统一接管
      *
      * @param {HTMLElement} menu
      */
     function ensureCustomRateItems(menu) {
-        const allExistingMenuItems = getRateMenuItems(menu);
-        const nativeMenuItems = getNativeRateMenuItems(menu);
-        const templateItem = nativeMenuItems[0] || allExistingMenuItems[0] || null;
-        const nativeItemMap = new Map();
+        const sortedRates = getConfiguredRates().sort((left, right) => left - right);
+        const desiredRates = buildMenuRenderRates(sortedRates);
+        const existingMenuItems = getRateMenuItems(menu);
+        const templateItem = existingMenuItems[0] || null;
 
-        nativeMenuItems.forEach((menuItem) => {
-            const itemRate = parseRateFromMenuItem(menuItem);
-            if (itemRate !== null && !nativeItemMap.has(itemRate)) {
-                nativeItemMap.set(itemRate, menuItem);
-            }
+        existingMenuItems.forEach((menuItem) => {
+            menuItem.remove();
         });
 
-        const desiredRates = buildDesiredMenuRates(menu);
-        const nativeRateSet = new Set(nativeItemMap.keys());
-
-        if (isRateMenuStructureSynced(menu, desiredRates, nativeRateSet)) {
-            return;
-        }
-
-        const reusableCustomItemMap = new Map();
-        allExistingMenuItems.forEach((menuItem) => {
-            if (!isScriptCustomRateMenuItem(menuItem)) {
-                return;
-            }
-
-            const itemRate = parseRateFromMenuItem(menuItem);
-            if (
-                itemRate === null
-                || nativeRateSet.has(itemRate)
-                || reusableCustomItemMap.has(itemRate)
-            ) {
-                menuItem.remove();
-                return;
-            }
-
-            reusableCustomItemMap.set(itemRate, menuItem);
-        });
-
-        const desiredMenuItems = desiredRates.map((rate) => {
-            if (nativeItemMap.has(rate)) {
-                return nativeItemMap.get(rate);
-            }
-
-            return reusableCustomItemMap.get(rate) || createCustomRateMenuItem(templateItem, rate);
-        });
-
-        const usedCustomItems = new Set(
-            desiredMenuItems.filter(
-                (menuItem) => menuItem instanceof HTMLElement && isScriptCustomRateMenuItem(menuItem)
-            )
-        );
-        getRateMenuItems(menu).forEach((menuItem) => {
-            if (isScriptCustomRateMenuItem(menuItem) && !usedCustomItems.has(menuItem)) {
-                menuItem.remove();
-            }
-        });
-
-        desiredMenuItems.forEach((menuItem) => {
-            if (menuItem instanceof HTMLElement) {
-                menu.appendChild(menuItem);
-            }
+        desiredRates.forEach((rate) => {
+            menu.appendChild(createCustomRateMenuItem(templateItem, rate));
         });
     }
 
@@ -2130,22 +2182,69 @@
     }
 
     /**
-     * 根据快捷键查找对应的“增减倍速动作”。
+     * 判断某个 KeyboardEvent 是否命中了指定的“增减倍速快捷键”。
      *
-     * @param {string} shortcut
-     * @returns {'increase'|'decrease'|''}
+     * 这里和固定倍速快捷键不同，特意允许“额外修饰键”存在。
+     * 这样当你先按住一个带 Shift 的加速键，再去按减速键时，
+     * 第二个按键即使被事件带上了额外的 Shift，也仍然能正确识别。
+     *
+     * @param {KeyboardEvent} event
+     * @param {string} configuredShortcut
+     * @returns {boolean}
      */
-    function getRateAdjustActionByShortcut(shortcut) {
-        const normalizedShortcut = normalizeShortcutAllowPlainKey(shortcut);
+    function matchesRateAdjustShortcutFromEvent(event, configuredShortcut) {
+        const normalizedShortcut = normalizeShortcutAllowPlainKey(configuredShortcut);
         if (!normalizedShortcut) {
-            return '';
+            return false;
         }
 
-        if (normalizedShortcut === state.settings.rateAdjustShortcuts.increase) {
+        const shortcutParts = normalizedShortcut.split('+');
+        const requiredKey = shortcutParts[shortcutParts.length - 1];
+        const requiredModifiers = new Set(shortcutParts.slice(0, -1));
+        const eventMainKey = normalizeSingleShortcutTokenFromKeyboardEvent(event);
+        if (!eventMainKey || ['ctrl', 'alt', 'shift', 'meta'].includes(eventMainKey)) {
+            return false;
+        }
+
+        if (eventMainKey !== requiredKey) {
+            return false;
+        }
+
+        const currentModifiers = new Set();
+        if (event.ctrlKey) {
+            currentModifiers.add('ctrl');
+        }
+        if (event.altKey) {
+            currentModifiers.add('alt');
+        }
+        if (event.shiftKey) {
+            currentModifiers.add('shift');
+        }
+        if (event.metaKey) {
+            currentModifiers.add('meta');
+        }
+
+        for (const modifier of requiredModifiers) {
+            if (!currentModifiers.has(modifier)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 根据 KeyboardEvent 查找对应的“增减倍速动作”。
+     *
+     * @param {KeyboardEvent} event
+     * @returns {'increase'|'decrease'|''}
+     */
+    function getRateAdjustActionByKeyboardEvent(event) {
+        if (matchesRateAdjustShortcutFromEvent(event, state.settings.rateAdjustShortcuts.increase)) {
             return 'increase';
         }
 
-        if (normalizedShortcut === state.settings.rateAdjustShortcuts.decrease) {
+        if (matchesRateAdjustShortcutFromEvent(event, state.settings.rateAdjustShortcuts.decrease)) {
             return 'decrease';
         }
 
@@ -2199,16 +2298,12 @@
 
         /**
          * “增减倍速”是按 0.1x 连续细调的链路。
-         * 这里如果在命中 0.5 / 1.0 / 1.5 / 2.0 等原生值时还强行走“模拟点击原生菜单项”，
-         * 一旦页面当前没有真正接住这次 synthetic click，就会表现成“卡在 1.4 上不去 1.5”
-         * 或“从 1.1 下不来 1.0”。
-         *
-         * 因此这里明确禁用“优先触发原生项”，统一直接写 playbackRate，
-         * 保证 0.1x 步进链路连续、可预测、不丢档。
+         * 现在菜单已经完全由脚本自己接管，所以这里和固定倍速快捷键一样，
+         * 统一直接写 `playbackRate`，保证 0.1x 步进链路连续、可预测、不丢档。
          */
-        applyPlaybackRateFromUserAction(video, targetRate, {
-            preferNativeMenuItem: false
-        });
+        state.lastRateAdjustAction = action;
+        state.lastRateAdjustTriggeredAt = Date.now();
+        applyPlaybackRateFromUserAction(video, targetRate);
         showCenterRateHint(targetRate);
         console.log(`[B站倍速助手] 已通过增减快捷键调整到 ${targetRate}x`);
         return true;
@@ -2319,6 +2414,191 @@
     }
 
     /**
+     * 把当前按键规整成一个“单独的按键 token”。
+     * 这个 token 只描述当前被按下/松开的那个键本身，不包含其他修饰键，
+     * 主要用于统计“当前一共按住了哪些键”，从而识别“两个快捷键同时按下”的情况。
+     *
+     * @param {KeyboardEvent} event
+     * @returns {string}
+     */
+    function normalizeSingleShortcutTokenFromKeyboardEvent(event) {
+        const modifierAliasMap = {
+            Control: 'ctrl',
+            Alt: 'alt',
+            Shift: 'shift',
+            Meta: 'meta'
+        };
+        const codeKeyMap = {
+            Minus: '-',
+            Equal: '=',
+            BracketLeft: '[',
+            BracketRight: ']',
+            Backslash: '\\',
+            Semicolon: ';',
+            Quote: '\'',
+            Comma: ',',
+            Period: '.',
+            Slash: '/',
+            Backquote: '`',
+            NumpadAdd: '+',
+            NumpadSubtract: '-',
+            NumpadMultiply: '*',
+            NumpadDivide: '/',
+            NumpadDecimal: '.'
+        };
+        const keyAliasMap = {
+            ' ': 'space',
+            Spacebar: 'space',
+            Escape: 'esc',
+            Esc: 'esc',
+            ArrowUp: 'arrowup',
+            ArrowDown: 'arrowdown',
+            ArrowLeft: 'arrowleft',
+            ArrowRight: 'arrowright'
+        };
+        const shiftKeyMap = {
+            '!': '1',
+            '@': '2',
+            '#': '3',
+            '$': '4',
+            '%': '5',
+            '^': '6',
+            '&': '7',
+            '*': '8',
+            '(': '9',
+            ')': '0',
+            '_': '-',
+            '+': '=',
+            '{': '[',
+            '}': ']',
+            '|': '\\',
+            ':': ';',
+            '"': '\'',
+            '<': ',',
+            '>': '.',
+            '?': '/',
+            '~': '`'
+        };
+        if (modifierAliasMap[event.key]) {
+            return modifierAliasMap[event.key];
+        }
+
+        let normalizedKey = '';
+        if (event.code && /^Key[A-Z]$/.test(event.code)) {
+            normalizedKey = event.code.slice(3).toLowerCase();
+        } else if (event.code && /^Digit\d$/.test(event.code)) {
+            normalizedKey = event.code.slice(5);
+        } else if (event.code && codeKeyMap[event.code]) {
+            normalizedKey = codeKeyMap[event.code];
+        } else {
+            normalizedKey = keyAliasMap[event.key] || String(event.key || '').toLowerCase();
+        }
+
+        if (event.shiftKey && shiftKeyMap[normalizedKey]) {
+            normalizedKey = shiftKeyMap[normalizedKey];
+        }
+
+        return normalizedKey;
+    }
+
+    /**
+     * 判断当前按住的 token 集合，是否命中了某一个已配置快捷键。
+     *
+     * 规则是：
+     * - 主键必须正在按住
+     * - 需要的修饰键必须全部按住
+     * - 修饰键集合必须完全一致，避免 `ctrl+j` 时把裸 `j` 也算进去
+     * - 允许额外按着别的主键，这样才能识别“两个快捷键同时按下”
+     *
+     * @param {Set<string>} pressedTokens
+     * @param {string} shortcut
+     * @param {boolean} [allowPlainKey=false]
+     * @returns {boolean}
+     */
+    function isShortcutActiveInPressedTokens(pressedTokens, shortcut, allowPlainKey = false) {
+        const normalizedShortcut = allowPlainKey
+            ? normalizeShortcutAllowPlainKey(shortcut)
+            : normalizeShortcut(shortcut);
+        if (!normalizedShortcut) {
+            return false;
+        }
+
+        const parts = normalizedShortcut.split('+');
+        const requiredKey = parts[parts.length - 1];
+        const requiredModifiers = new Set(parts.slice(0, -1));
+        const currentModifiers = new Set(
+            ['ctrl', 'alt', 'shift', 'meta'].filter((modifier) => pressedTokens.has(modifier))
+        );
+
+        if (!pressedTokens.has(requiredKey)) {
+            return false;
+        }
+
+        if (currentModifiers.size !== requiredModifiers.size) {
+            return false;
+        }
+
+        for (const modifier of requiredModifiers) {
+            if (!pressedTokens.has(modifier)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 当“增加倍速”和“减少倍速”两个方向的快捷键同时介入时，把倍速直接归回 1x。
+     *
+     * 这里不再通过“当前按住了哪些 token”去间接推断，而是直接利用现有长按链路状态：
+     * - 第一个增减快捷键按下时，会先占据 `state.rateAdjustHoldAction`
+     * - 如果紧接着又按下另一个方向的增减快捷键，就说明用户想触发“归 1x”
+     *
+     * 这种判断更贴近真实交互，也能避开某些组合键在 keydown/keyup 时序上的细节误差。
+     *
+     * @param {'increase'|'decrease'|''} nextAction
+     * @returns {boolean}
+     */
+    function tryResetPlaybackRateByRateAdjustShortcuts(nextAction) {
+        if (!nextAction) {
+            state.multiShortcutResetTriggered = false;
+            return false;
+        }
+
+        const now = Date.now();
+        const hasOppositeActiveHold = (
+            state.rateAdjustHoldAction
+            && state.rateAdjustHoldAction !== nextAction
+        );
+        const hasRecentOppositeAdjust = (
+            state.lastRateAdjustAction
+            && state.lastRateAdjustAction !== nextAction
+            && now - state.lastRateAdjustTriggeredAt <= RATE_ADJUST_REVERSE_RESET_WINDOW_MS
+        );
+
+        if (!hasOppositeActiveHold && !hasRecentOppositeAdjust) {
+            state.multiShortcutResetTriggered = false;
+            return false;
+        }
+
+        if (state.multiShortcutResetTriggered) {
+            return true;
+        }
+
+        const video = findVideoElement();
+        if (!video) {
+            return false;
+        }
+
+        state.multiShortcutResetTriggered = true;
+        stopRateAdjustHold();
+        applyPlaybackRateFromUserAction(video, DEFAULT_PLAYBACK_RATE);
+        showCenterRateHint(DEFAULT_PLAYBACK_RATE);
+        console.log('[B站倍速助手] 检测到增减倍速快捷键同时按下，已归回 1.0x');
+        return true;
+    }
+
+    /**
      * 把 KeyboardEvent 里的按键转换成可和配置字符串对比的标准形式.
      * 对包含 shift 的符号键，需要回推成原始按键:
      * 例如 event.key 可能是 "#"，但我们希望匹配成 "3".
@@ -2328,6 +2608,24 @@
      * @returns {string}
      */
     function normalizeShortcutFromKeyboardEvent(event, requireModifier = true) {
+        const codeKeyMap = {
+            Minus: '-',
+            Equal: '=',
+            BracketLeft: '[',
+            BracketRight: ']',
+            Backslash: '\\',
+            Semicolon: ';',
+            Quote: '\'',
+            Comma: ',',
+            Period: '.',
+            Slash: '/',
+            Backquote: '`',
+            NumpadAdd: '+',
+            NumpadSubtract: '-',
+            NumpadMultiply: '*',
+            NumpadDivide: '/',
+            NumpadDecimal: '.'
+        };
         const keyAliasMap = {
             ' ': 'space',
             Spacebar: 'space',
@@ -2367,7 +2665,16 @@
             return '';
         }
 
-        let normalizedKey = keyAliasMap[rawKey] || rawKey.toLowerCase();
+        let normalizedKey = '';
+        if (event.code && /^Key[A-Z]$/.test(event.code)) {
+            normalizedKey = event.code.slice(3).toLowerCase();
+        } else if (event.code && /^Digit\d$/.test(event.code)) {
+            normalizedKey = event.code.slice(5);
+        } else if (event.code && codeKeyMap[event.code]) {
+            normalizedKey = codeKeyMap[event.code];
+        } else {
+            normalizedKey = keyAliasMap[rawKey] || rawKey.toLowerCase();
+        }
 
         if (event.shiftKey && shiftKeyMap[normalizedKey]) {
             normalizedKey = shiftKeyMap[normalizedKey];
@@ -2429,8 +2736,15 @@
             }
 
             const adjustShortcut = normalizeShortcutFromKeyboardEvent(event, false);
-            const rateAdjustAction = getRateAdjustActionByShortcut(adjustShortcut);
+            const rateAdjustAction = getRateAdjustActionByKeyboardEvent(event);
             if (rateAdjustAction) {
+                if (tryResetPlaybackRateByRateAdjustShortcuts(rateAdjustAction)) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    event.stopImmediatePropagation();
+                    return;
+                }
+
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation();
@@ -2472,6 +2786,8 @@
         };
 
         const handleKeyup = (event) => {
+            state.multiShortcutResetTriggered = false;
+
             if (shouldStopRateAdjustHoldByKeyup(event)) {
                 stopRateAdjustHold();
             }
@@ -2479,6 +2795,7 @@
 
         const handleForceStopHold = () => {
             stopRateAdjustHold();
+            state.multiShortcutResetTriggered = false;
         };
 
         window.addEventListener('keydown', handleKeydown, true);
@@ -2487,6 +2804,7 @@
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 stopRateAdjustHold();
+                state.multiShortcutResetTriggered = false;
             }
         });
     }
@@ -2500,15 +2818,16 @@
     function restoreSavedRateIfNeeded(video) {
         if (state.lastSavedRate === null) {
             state.restoreMark = {
-                videoKey: state.currentVideoKey,
+                videoContextId: state.currentVideoContextId,
                 videoElement: video
             };
+            state.waitingForInitialRestore = false;
             console.log('[B站倍速助手] 当前视频没有历史倍速记录，不主动改动当前播放器倍速');
             return;
         }
 
         if (
-            state.restoreMark.videoKey === state.currentVideoKey
+            state.restoreMark.videoContextId === state.currentVideoContextId
             && state.restoreMark.videoElement === video
         ) {
             return;
@@ -2529,9 +2848,10 @@
                 targetRate: null
             };
             state.restoreMark = {
-                videoKey: state.currentVideoKey,
+                videoContextId: state.currentVideoContextId,
                 videoElement: video
             };
+            state.waitingForInitialRestore = false;
             return;
         }
 
@@ -2560,6 +2880,7 @@
             videoElement: video,
             targetRate
         };
+        state.waitingForInitialRestore = true;
         applyPlaybackRateWithRetry(video, targetRate);
         console.log(`[B站倍速助手] 正在尝试恢复当前视频倍速为 ${targetRate}x`);
     }
@@ -2613,7 +2934,11 @@
      */
     function refreshVideoContext() {
         const nextVideoKey = buildCurrentVideoKey();
-        if (nextVideoKey === state.currentVideoKey) {
+        const nextVideoContextId = buildCurrentVideoContextId();
+        if (
+            nextVideoKey === state.currentVideoKey
+            && nextVideoContextId === state.currentVideoContextId
+        ) {
             return;
         }
 
@@ -2622,17 +2947,26 @@
             videoElement: null,
             targetRate: null
         };
+        state.waitingForInitialRestore = true;
+        stopRateAdjustHold();
+        state.multiShortcutResetTriggered = false;
         state.currentVideoKey = nextVideoKey;
+        state.currentVideoContextId = nextVideoContextId;
         state.lastSavedRate = loadSavedRate(nextVideoKey);
         state.restoreMark = {
-            videoKey: '',
+            videoContextId: '',
             videoElement: null
         };
+        const isCollectionContext = nextVideoKey.includes(':collection:');
 
         if (state.lastSavedRate === null) {
-            console.log('[B站倍速助手] 检测到站内跳转，新视频没有历史倍速记录');
+            console.log(
+                `[B站倍速助手] 检测到站内跳转，新的${isCollectionContext ? '合集' : '视频'}上下文没有历史倍速记录`
+            );
         } else {
-            console.log(`[B站倍速助手] 检测到站内跳转，新视频将恢复为 ${state.lastSavedRate}x`);
+            console.log(
+                `[B站倍速助手] 检测到站内跳转，新的${isCollectionContext ? '合集' : '视频'}上下文将恢复为 ${state.lastSavedRate}x`
+            );
         }
 
         scheduleBootstrap(120);
@@ -2644,22 +2978,40 @@
     function installRouteChangeListener() {
         const rawPushState = history.pushState;
         const rawReplaceState = history.replaceState;
+        let lastObservedHref = location.href;
 
         history.pushState = function (...args) {
             const result = rawPushState.apply(this, args);
+            lastObservedHref = location.href;
             setTimeout(refreshVideoContext, 120);
             return result;
         };
 
         history.replaceState = function (...args) {
             const result = rawReplaceState.apply(this, args);
+            lastObservedHref = location.href;
             setTimeout(refreshVideoContext, 120);
             return result;
         };
 
         window.addEventListener('popstate', () => {
+            lastObservedHref = location.href;
             setTimeout(refreshVideoContext, 120);
         });
+
+        /**
+         * 有些合集内切换不会可靠触发 pushState / replaceState，
+         * 但地址栏里的 `p=` 确实会变化。
+         * 这里补一个轻量轮询，专门兜住这种“URL 变了，但页面没有显式路由事件”的场景。
+         */
+        window.setInterval(() => {
+            if (location.href === lastObservedHref) {
+                return;
+            }
+
+            lastObservedHref = location.href;
+            refreshVideoContext();
+        }, 250);
     }
 
     /**
