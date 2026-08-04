@@ -171,6 +171,7 @@
         hrefWatchTimer: 0,
         hrefWatchLastObserved: location.href,
         hrefWatchIdleTicks: 0,
+        videoContextRefreshTimer: 0,
         restoreMark: {
             videoContextId: '',
             videoElement: null
@@ -3076,13 +3077,83 @@
     }
 
     /**
+     * 判断一次 DOM 变化是否与倍速 UI 相关。
+     *
+     * 背景：
+     * 长视频播放期间，页面除了弹幕外还有大量持续增删 DOM 的部件
+     * （字幕层、控制栏重绘、广告、推荐位等）。如果观察器对它们也响应，
+     * bootstrap 仍会以 150ms 的节奏高频执行重活，长时间播放后主线程被拖慢，
+     * 表现为点击暂停/播放延迟、长按加速只触发一次。
+     *
+     * 因此这里把响应范围收窄到真正需要的三类变化：
+     * 1. 倍速按钮 / 倍速菜单 / 菜单项 / 倍速结果文本 的增删或内部变化
+     * 2. video 元素的增删（视频源重建）
+     * 3. 播放器容器本身被增删（播放器整体重建）
+     *
+     * 其余任何变化（弹幕、字幕、控制栏、页面其他区域）一律视为无关并跳过。
+     *
+     * @param {MutationRecord} mutation
+     * @returns {boolean}
+     */
+    function isRateUiRelatedMutation(mutation) {
+        const danmakuSelector = '.bpx-player-dm-wrap, .bpx-player-dm, [class*="player-dm"]';
+        const rateUiNodeSelector = [
+            ...SELECTORS.rateButton,
+            ...SELECTORS.rateMenu,
+            ...SELECTORS.rateMenuItem,
+            ...SELECTORS.rateResult,
+            'video'
+        ].join(', ');
+        const playerContainerSelector = SELECTORS.playerContainer.join(', ');
+
+        const targetElement = mutation.target instanceof Element ? mutation.target : null;
+        // 弹幕容器内部的增删一律视为无关
+        if (targetElement && targetElement.closest(danmakuSelector)) {
+            return false;
+        }
+
+        const affectedNodes = [targetElement, ...mutation.addedNodes, ...mutation.removedNodes];
+        return affectedNodes.some((node) => (
+            node instanceof Element
+            && (
+                // 播放器容器本身被增删（播放器整体重建）
+                node.matches(playerContainerSelector)
+                // 节点是倍速 UI 节点，或位于倍速 UI 节点内部
+                || node.matches(rateUiNodeSelector)
+                || Boolean(node.closest(rateUiNodeSelector))
+            )
+        ));
+    }
+
+    /**
+     * 去抖后的视频上下文刷新。
+     *
+     * 背景：
+     * URL 的真实变化已经由 scheduleHrefWatch 的兜底轮询覆盖，
+     * 因此 DOM 观察器里不必每一批 DOM 变化都立刻执行 refreshVideoContext。
+     * 这里统一去抖，避免高频 DOM 波动带来无意义的 URL 解析和 DOM 遍历。
+     */
+    function scheduleVideoContextRefresh() {
+        clearTimeout(state.videoContextRefreshTimer);
+        state.videoContextRefreshTimer = window.setTimeout(() => {
+            refreshVideoContext();
+        }, 300);
+    }
+
+    /**
      * DOM 观察器负责兜住“播放器晚于脚本加载”“站内切页时局部重建 DOM”等场景.
      * 这里只做轻量监听，实际处理仍然交给去抖后的 bootstrap.
      */
     function installDomObserver() {
-        const observer = new MutationObserver(() => {
+        const observer = new MutationObserver((mutations) => {
+            // 只对与倍速 UI 相关的节点变化重新 bootstrap；
+            // 弹幕、字幕、控制栏等高频无关 DOM 波动一律不触发，避免拖垮主线程
+            if (!mutations.some((mutation) => isRateUiRelatedMutation(mutation))) {
+                return;
+            }
+
             scheduleBootstrap(150);
-            refreshVideoContext();
+            scheduleVideoContextRefresh();
         });
 
         observer.observe(document.documentElement, {
