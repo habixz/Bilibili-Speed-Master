@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站倍速助手
 // @namespace    /DBI/bilibili-speed-assistant
-// @version      1.2.0
+// @version      1.3.0
 // @description  完全自制倍速列表(支持两栏显示倍速菜单); 按视频/合集记忆倍速(兼容 B 站站内跳转); 新增增减倍速快捷键
 // @author       habixz
 // @match        https://www.bilibili.com/video/*
@@ -172,6 +172,8 @@
         hrefWatchLastObserved: location.href,
         hrefWatchIdleTicks: 0,
         videoContextRefreshTimer: 0,
+        domObserver: null,
+        observedPlayerScope: null,
         restoreMark: {
             videoContextId: '',
             videoElement: null
@@ -2740,18 +2742,144 @@
     }
 
     /**
-     * 输入框、文本域、可编辑区域内不处理快捷键，
-     * 否则用户改评论、搜视频、发弹幕时体验会很差.
+     * “输入区域”选择器，用于判断按键时是否正在输入。
+     *
+     * 注意这里刻意把 `input` 收窄成“真正的文本输入控件”：
+     * - 排除 checkbox / radio / button / submit / reset / range / color / file / image
+     * - B 站播放器弹幕开关（.bpx-player-dm-switch）内部藏着一个隐藏 checkbox input，
+     *   点击开关后焦点会落到这个 checkbox 上。如果仍按老写法匹配任意 `input`，
+     *   脚本会把“焦点在弹幕开关上”误判成“正在输入”，从而忽略音量/倍速快捷键，
+     *   表现为“点击弹幕开关后快捷键失效，需要再点击视频才能恢复”。
+     */
+    const IGNORED_INPUT_SELECTOR = [
+        'textarea',
+        'select',
+        'input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="range"]):not([type="color"]):not([type="file"]):not([type="image"])',
+        '[role="textbox"]',
+        '[contenteditable]:not([contenteditable="false"])'
+    ].join(', ');
+
+    /**
+     * 把任意事件目标尽量归一化成元素节点。
+     * 某些富文本编辑器里，keydown 的 target 可能是文本节点，
+     * 如果只接受 Element，就会把“正在输入”的场景漏过去。
      *
      * @param {EventTarget|null} target
+     * @returns {Element|null}
+     */
+    function getClosestTargetElement(target) {
+        if (target instanceof Element) {
+            return target;
+        }
+
+        if (target instanceof Node) {
+            return target.parentElement;
+        }
+
+        return null;
+    }
+
+    /**
+     * 判断某个元素是否位于真正的可编辑输入区域内。
+     * 这里统一兼容原生输入框、富文本编辑器，以及带 `role="textbox"` 的自定义输入控件。
+     *
+     * @param {Element|null} element
      * @returns {boolean}
      */
-    function shouldIgnoreShortcutTarget(target) {
-        if (!(target instanceof Element)) {
+    function isEditableElement(element) {
+        if (!(element instanceof Element)) {
             return false;
         }
 
-        return Boolean(target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'));
+        return Boolean(element.closest(IGNORED_INPUT_SELECTOR));
+    }
+
+    /**
+     * 获取当前文档里真正处于焦点链末端的元素。
+     * 之所以不用只看 `document.activeElement`，
+     * 是因为某些自定义输入控件会把真实焦点继续放进 shadowRoot 内部。
+     *
+     * @returns {Element|null}
+     */
+    function getDeepActiveElement() {
+        let activeElement = document.activeElement instanceof Element ? document.activeElement : null;
+
+        while (activeElement && activeElement.shadowRoot && activeElement.shadowRoot.activeElement instanceof Element) {
+            activeElement = activeElement.shadowRoot.activeElement;
+        }
+
+        return activeElement;
+    }
+
+    /**
+     * 从当前文本选区中推断用户是否正处于可编辑区域。
+     * 富文本编辑器里，键盘事件目标可能因为 Shadow DOM 重定向而不稳定，
+     * 但选区锚点通常仍然落在评论输入框内部的 contenteditable 节点上。
+     *
+     * @returns {boolean}
+     */
+    function isEditingFromSelection() {
+        const selection = window.getSelection();
+        if (!selection) {
+            return false;
+        }
+
+        const anchorElement = getClosestTargetElement(selection.anchorNode);
+        const focusElement = getClosestTargetElement(selection.focusNode);
+
+        return isEditableElement(anchorElement) || isEditableElement(focusElement);
+    }
+
+    /**
+     * 从事件传播路径里检查是否命中了可编辑区域。
+     * B 站评论区输入框埋在多层 Shadow DOM 内部（bili-comments Web Component），
+     * 捕获阶段的 event.target 会被浏览器重定向成外层自定义元素（host），
+     * 导致传统的 `target.closest()` 检测失效；
+     * 但 `event.composedPath()` 仍然保留完整的真实传播路径，
+     * 因此能命中 Shadow DOM 深处真正带 contenteditable 的输入节点。
+     *
+     * @param {KeyboardEvent} event
+     * @returns {boolean}
+     */
+    function isEditingFromEventPath(event) {
+        if (typeof event.composedPath !== 'function') {
+            return false;
+        }
+
+        const path = event.composedPath();
+        return path.some((pathItem) => {
+            const element = getClosestTargetElement(pathItem);
+            return isEditableElement(element);
+        });
+    }
+
+    /**
+     * 输入框、文本域、可编辑区域内不处理快捷键，
+     * 否则用户改评论、搜视频、发弹幕时体验会很差。
+     *
+     * 这里综合检查：
+     * 1. 事件目标（已归一化为元素，兼容文本节点）
+     * 2. 事件传播路径（穿透 Shadow DOM，覆盖 B 站评论区富文本输入框）
+     * 3. 当前焦点元素（递归进入 shadowRoot，找到真正的输入节点）
+     * 4. 当前文本选区（富文本编辑器里光标所在位置）
+     *
+     * @param {KeyboardEvent} event
+     * @returns {boolean}
+     */
+    function shouldIgnoreShortcutTarget(event) {
+        const targetElement = getClosestTargetElement(event.target);
+        const activeElement = getDeepActiveElement();
+
+        if (document.designMode === 'on') {
+            return true;
+        }
+
+        return (
+            isEditableElement(targetElement)
+            || isEditableElement(activeElement)
+            || isEditingFromEventPath(event)
+            || isEditingFromSelection()
+        );
     }
 
     /**
@@ -2764,7 +2892,7 @@
                 return;
             }
 
-            if (shouldIgnoreShortcutTarget(event.target)) {
+            if (shouldIgnoreShortcutTarget(event)) {
                 return;
             }
 
@@ -2929,6 +3057,9 @@
      * @param {number} attempt
      */
     function bootstrap(attempt) {
+        // 校准 DOM 观察器的观察范围（播放器容器出现/移除时，在容器级与 body 顶层之间切换）
+        syncDomObservationScope();
+
         const video = findVideoElement();
         const menu = findPlaybackRateMenu();
 
@@ -3104,7 +3235,10 @@
             ...SELECTORS.rateResult,
             'video'
         ].join(', ');
-        const playerContainerSelector = SELECTORS.playerContainer.join(', ');
+        const playerContainerSelector = [
+            ...SELECTORS.playerContainer,
+            '#bilibili-player'
+        ].join(', ');
 
         const targetElement = mutation.target instanceof Element ? mutation.target : null;
         // 弹幕容器内部的增删一律视为无关
@@ -3141,13 +3275,74 @@
     }
 
     /**
+     * 同步 DOM 观察器的观察范围（结构级收窄，弹幕/字幕/控制栏高频区域零开销）。
+     *
+     * 背景：
+     * 上一版把观察范围收窄到“播放器容器 subtree”，但弹幕层、字幕层、控制栏
+     * 本身就在播放器容器内部——长视频播放时它们依然以每帧几十条的速度增删，
+     * 浏览器仍要逐条生成并分派 mutation 记录给脚本，主线程开销并没有真正降下来，
+     * 表现为“弹幕很少的视频播放久了依然卡”。
+     *
+     * 本版改为只观察“结构性变化”：
+     * 1. document.body 顶层子节点增删：捕获播放器容器挂载/移除前的兜底入口。
+     * 2. 播放器容器的直接子节点增删（刻意不递归 subtree）：
+     *    捕获视频层/控制栏整体挂载、播放器整体重建这类“大结构变化”。
+     *    弹幕层、字幕层、控制栏内部的重绘都发生在容器深层，不会产生任何 mutation。
+     * 3. 倍速按钮内部 subtree：捕获倍速菜单挂载/移除（菜单是按钮的后代）。
+     *
+     * 这样观察器平时几乎不触发，弹幕/字幕/控制栏的高频增删完全不经过观察器，
+     * 长视频播放期间的主线程持续占用被彻底移除。
+     */
+    function syncDomObservationScope() {
+        const observer = state.domObserver;
+        if (!observer) {
+            return;
+        }
+
+        const playerContainer = queryFirst(SELECTORS.playerContainer);
+        const rateButton = queryFirst(SELECTORS.rateButton);
+        const scopeKey = [
+            playerContainer ? 'player' : 'body',
+            rateButton ? 'rateButton' : 'none'
+        ].join(':');
+        if (state.observedPlayerScope === scopeKey) {
+            return;
+        }
+        state.observedPlayerScope = scopeKey;
+
+        observer.disconnect();
+
+        // 1. 顶层兜底：播放器容器出现前捕获其挂载。
+        //    B 站容器挂载位置较深，顶层观察未必捕获得到，
+        //    真正的重校准由 bootstrap 每次执行时调用本函数完成。
+        observer.observe(document.body, { childList: true });
+
+        // 2. 播放器容器：只观察直接子节点增删，刻意不递归 subtree。
+        if (playerContainer) {
+            observer.observe(playerContainer, { childList: true });
+        }
+
+        // 3. 倍速按钮内部：递归观察，捕获菜单挂载/移除。
+        if (rateButton) {
+            observer.observe(rateButton, { childList: true, subtree: true });
+        }
+    }
+
+    /**
      * DOM 观察器负责兜住“播放器晚于脚本加载”“站内切页时局部重建 DOM”等场景.
-     * 这里只做轻量监听，实际处理仍然交给去抖后的 bootstrap.
+     * 观察范围由 syncDomObservationScope 收窄到“结构级变化”：
+     * - 播放器容器的直接子节点增删（视频层/控制栏挂载、播放器重建）
+     * - 倍速按钮内部增删（倍速菜单挂载/移除）
+     * 弹幕、字幕、控制栏内部重绘等高频波动完全不经过观察器，
+     * 实际处理统一交给去抖后的 bootstrap.
      */
     function installDomObserver() {
         const observer = new MutationObserver((mutations) => {
-            // 只对与倍速 UI 相关的节点变化重新 bootstrap；
-            // 弹幕、字幕、控制栏等高频无关 DOM 波动一律不触发，避免拖垮主线程
+            // 先按当前 DOM 状态切换观察范围（例如播放器容器刚挂载/被移除时）
+            syncDomObservationScope();
+
+            // 只对与倍速 UI 相关的结构性节点变化重新 bootstrap；
+            // 到这里的 mutation 只会是“播放器容器/视频层/控制栏整体挂载”或“倍速菜单挂载/移除”
             if (!mutations.some((mutation) => isRateUiRelatedMutation(mutation))) {
                 return;
             }
@@ -3156,10 +3351,8 @@
             scheduleVideoContextRefresh();
         });
 
-        observer.observe(document.documentElement, {
-            childList: true,
-            subtree: true
-        });
+        state.domObserver = observer;
+        syncDomObservationScope();
     }
 
     /**
