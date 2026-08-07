@@ -3063,7 +3063,18 @@
         const video = findVideoElement();
         const menu = findPlaybackRateMenu();
 
-        if (!video && attempt < BOOTSTRAP_RETRY_LIMIT) {
+        /**
+         * video 和 menu 缺一不可时才继续重试。
+         *
+         * 之前只判断 video，导致这样一个真实 bug：
+         * B 站播放器的渲染顺序是 video 先出现、倍速按钮/菜单（挂在控制栏内部）后出现。
+         * bootstrap 第一次命中 video 时菜单还没渲染出来，`ensureCustomRateItems` 被跳过，
+         * 而又因为 video 已存在不再重试，菜单就永远停在原生状态；
+         * 直到按快捷键触发提示层改动播放器容器 DOM、观察器重新 bootstrap 后才被接管。
+         *
+         * 这里改成菜单缺失也持续重试，保证菜单一出现就会被立即接管为脚本自定义面板。
+         */
+        if ((!video || !menu) && attempt < BOOTSTRAP_RETRY_LIMIT) {
             scheduleBootstrap(BOOTSTRAP_RETRY_DELAY, attempt + 1);
             return;
         }
@@ -3292,11 +3303,16 @@
      *
      * 这样观察器平时几乎不触发，弹幕/字幕/控制栏的高频增删完全不经过观察器，
      * 长视频播放期间的主线程持续占用被彻底移除。
+     *
+     * @returns {boolean} 观察范围是否发生了变化。调用方（观察器回调）据此决定
+     *                    是否需要立即重新 bootstrap，避免“倍速按钮/菜单挂载在
+     *                    观察范围之外、bootstrap 又已退出重试”的死区让菜单长期
+     *                    停留在原生状态。
      */
     function syncDomObservationScope() {
         const observer = state.domObserver;
         if (!observer) {
-            return;
+            return false;
         }
 
         const playerContainer = queryFirst(SELECTORS.playerContainer);
@@ -3306,7 +3322,7 @@
             rateButton ? 'rateButton' : 'none'
         ].join(':');
         if (state.observedPlayerScope === scopeKey) {
-            return;
+            return false;
         }
         state.observedPlayerScope = scopeKey;
 
@@ -3326,6 +3342,9 @@
         if (rateButton) {
             observer.observe(rateButton, { childList: true, subtree: true });
         }
+
+        // 观察范围发生了切换，调用方需要据此决定是否立即重新 bootstrap。
+        return true;
     }
 
     /**
@@ -3338,12 +3357,18 @@
      */
     function installDomObserver() {
         const observer = new MutationObserver((mutations) => {
-            // 先按当前 DOM 状态切换观察范围（例如播放器容器刚挂载/被移除时）
-            syncDomObservationScope();
+            // 先按当前 DOM 状态切换观察范围（例如播放器容器刚挂载/被移除时）。
+            // 观察范围一旦变化，说明播放器容器或倍速按钮刚出现/消失，
+            // 此时必须立即重新 bootstrap，否则倍速按钮/菜单若恰好挂载在
+            // 旧观察范围之外，就会被漏掉而一直停留在原生菜单状态。
+            const scopeChanged = syncDomObservationScope();
 
             // 只对与倍速 UI 相关的结构性节点变化重新 bootstrap；
             // 到这里的 mutation 只会是“播放器容器/视频层/控制栏整体挂载”或“倍速菜单挂载/移除”
-            if (!mutations.some((mutation) => isRateUiRelatedMutation(mutation))) {
+            if (
+                !scopeChanged
+                && !mutations.some((mutation) => isRateUiRelatedMutation(mutation))
+            ) {
                 return;
             }
 
