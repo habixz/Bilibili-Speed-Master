@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站倍速助手
 // @namespace    /DBI/bilibili-speed-assistant
-// @version      1.3.0
+// @version      1.3.1
 // @description  完全自制倍速列表(支持两栏显示倍速菜单); 按视频/合集记忆倍速(兼容 B 站站内跳转); 新增增减倍速快捷键
 // @author       habixz
 // @match        https://www.bilibili.com/video/*
@@ -129,6 +129,22 @@
         collectionCount: [
             '.video-pod__header .amt',
             '.amt'
+        ],
+        /**
+         * “合集”页（多个不同视频组成一个集合，区别于“分P”）的特征选择器。
+         * - collectionSeasonLink: 合集头部标题是一个链接到合集详情页
+         *   （channel/collectiondetail?sid=xxx）的 `<a>`，sid 是合集全局唯一 ID
+         * - collectionSectionItem: 合集列表顶部有分区标签，
+         *   data-slide-value 是分区 ID，同一合集内所有视频一致
+         */
+        collectionSeasonLink: [
+            '.video-pod__header a.title[href*="collectiondetail"]',
+            '.video-pod__header a[href*="collectiondetail"]',
+            'a[href*="collectiondetail"]'
+        ],
+        collectionSectionItem: [
+            '.video-pod__slide .slide-item[data-slide-value]',
+            '[class*="video-pod__slide"] [data-slide-value]'
         ]
     };
 
@@ -174,6 +190,7 @@
         videoContextRefreshTimer: 0,
         domObserver: null,
         observedPlayerScope: null,
+        observedCollectionRoot: null,
         restoreMark: {
             videoContextId: '',
             videoElement: null
@@ -1324,6 +1341,47 @@
     }
 
     /**
+     * 找到“合集”页的“视频选集”区域根节点。
+     *
+     * B 站页面里“合集”（多个不同视频组成的集合）和“分P”（同一个视频的多个部分）
+     * 都复用了 `video-pod` 结构，但两者有明显区别：
+     * - 分P: 头部标题是固定文本“视频选集”，列表项 `data-key` 是数字 cid，没有分区标签
+     * - 合集: 头部标题是合集名（链接到 collectiondetail?sid=xxx），
+     *   顶部有分区标签（.video-pod__slide .slide-item[data-slide-value]），
+     *   列表项 `data-key` 是 BV 号
+     *
+     * 这里优先用“分区标签”和“合集详情链接”两个特征定位合集根节点，
+     * 与 `findCollectionListRoot` 的“视频选集标题”路径互不干扰。
+     *
+     * @returns {HTMLElement|null}
+     */
+    function findUgcCollectionRoot() {
+        // 特征1：顶部存在分区标签（.video-pod__slide）——合集最明显的特征
+        for (const selector of SELECTORS.collectionSectionItem) {
+            const sectionItem = document.querySelector(selector);
+            if (sectionItem instanceof HTMLElement) {
+                const collectionRoot = sectionItem.closest('.video-pod') || sectionItem.closest('[class*="video-pod"]');
+                if (collectionRoot instanceof HTMLElement) {
+                    return collectionRoot;
+                }
+            }
+        }
+
+        // 特征2：头部标题链接到合集详情页（含 sid 参数）
+        for (const selector of SELECTORS.collectionSeasonLink) {
+            const seasonLink = document.querySelector(selector);
+            if (seasonLink instanceof HTMLElement) {
+                const collectionRoot = seasonLink.closest('.video-pod') || seasonLink.closest('[class*="video-pod"]');
+                if (collectionRoot instanceof HTMLElement) {
+                    return collectionRoot;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * 给合集页面做一个“页面家族”标签。
      * 如果后面拿不到足够稳定的合集特征，就退一步按这个家族共享倍速，
      * 这样至少能做到“合集页之间继承”，不会退回到完全按单视频隔离。
@@ -1378,6 +1436,57 @@
     }
 
     /**
+     * 构造“合集”作用域键。
+     *
+     * 对合集页（多个不同视频组成一个集合），倍速应该在整集合内共享，
+     * 所以键必须与“当前是哪个视频”无关，只与“是哪个合集”有关。
+     *
+     * 指纹优先级（从最稳定到最弱）：
+     * 1. 合集 ID（sid）：合集头部标题链接到 collectiondetail?sid=xxx，sid 全局唯一
+     * 2. 分区 ID 列表：.video-pod__slide 下每个分区标签的 data-slide-value
+     * 3. 列表项 BV 号：data-key 形如 BVxxxxxxxxxx 的前若干个条目
+     *
+     * 无法识别为合集时返回空字符串，由调用方走分P/单视频的逻辑。
+     *
+     * @returns {string}
+     */
+    function buildUgcCollectionScopeKey() {
+        const collectionRoot = findUgcCollectionRoot();
+        if (!collectionRoot) {
+            return '';
+        }
+
+        // 1. 合集 ID（sid）最稳定，直接从头部标题链接的 href 里提取
+        const seasonLink = collectionRoot.querySelector(SELECTORS.collectionSeasonLink.join(', '));
+        if (seasonLink instanceof HTMLElement) {
+            const sidMatch = (seasonLink.getAttribute('href') || '').match(/[?&]sid=(\d+)/);
+            if (sidMatch) {
+                return `collection:season:${sidMatch[1]}`;
+            }
+        }
+
+        // 2. 分区 ID 列表（排序后拼接，保证同一合集的键一致）
+        const sectionIds = [...collectionRoot.querySelectorAll(SELECTORS.collectionSectionItem.join(', '))]
+            .map((sectionItem) => sectionItem.getAttribute('data-slide-value'))
+            .filter(Boolean)
+            .sort();
+        if (sectionIds.length > 0) {
+            return `collection:sections:${sectionIds.join(',')}`;
+        }
+
+        // 3. 列表项 BV 号（只在拿不到更稳定特征时兜底，避免同一合集被拆成多个键）
+        const itemBvids = [...collectionRoot.querySelectorAll(SELECTORS.collectionItem.join(', '))]
+            .map((itemNode) => itemNode.dataset.key)
+            .filter((dataKey) => typeof dataKey === 'string' && /^BV[0-9A-Za-z]{10}$/.test(dataKey))
+            .slice(0, 12);
+        if (itemBvids.length > 0) {
+            return `collection:video:keys:${itemBvids.join(',')}`;
+        }
+
+        return '';
+    }
+
+    /**
      * 从“视频选集”区域提取尽量稳定的合集指纹。
      *
      * 优先使用列表项的 `data-key`，因为它通常比标题文本更稳定；
@@ -1388,6 +1497,13 @@
      * @returns {string}
      */
     function buildCollectionScopeKey() {
+        // 1. 合集页（多个不同视频组成的集合）：优先按合集指纹共享倍速
+        const ugcCollectionKey = buildUgcCollectionScopeKey();
+        if (ugcCollectionKey) {
+            return ugcCollectionKey;
+        }
+
+        // 2. 分P视频 / 普通视频：继续按 URL 键记忆
         const collectionScopeKeyFromUrl = buildCollectionScopeKeyFromUrl();
         if (collectionScopeKeyFromUrl) {
             return collectionScopeKeyFromUrl;
@@ -1869,6 +1985,15 @@
             targetRate: null
         };
         state.waitingForInitialRestore = true;
+        /**
+         * 视频源重载时再核对一次合集/视频上下文。
+         *
+         * SPA 从一个合集切到另一个合集的视频时，如果 video 元素被复用（只换媒体源），
+         * 页面不会整刷，而“合集指纹”是从 DOM 里提取的，此时可能还是旧合集的键。
+         * 视频元数据加载完时，新页面的合集列表通常也已渲染好，
+         * 这里去抖触发一次 refreshVideoContext，把键校正到新合集后再恢复倍速。
+         */
+        scheduleVideoContextRefresh();
         scheduleBootstrap(80);
     }
 
@@ -2219,9 +2344,16 @@
     /**
      * 判断某个 KeyboardEvent 是否命中了指定的“增减倍速快捷键”。
      *
-     * 这里和固定倍速快捷键不同，特意允许“额外修饰键”存在。
-     * 这样当你先按住一个带 Shift 的加速键，再去按减速键时，
-     * 第二个按键即使被事件带上了额外的 Shift，也仍然能正确识别。
+     * 与固定倍速快捷键不同，这里在特定条件下允许“额外修饰键”存在：
+     * 当你先按住一个带修饰键的加速键（如 Shift+↑），再去按减速键（如 ↓）时，
+     * 第二个按键的事件会自带多余的 Shift。为了不破坏“增减快捷键同时按下归 1x”
+     * 的交互，此时仍然要放行。
+     *
+     * 但额外修饰键不能无条件放行——否则配置裸键（如 Tab）作为减少倍速快捷键时，
+     * 按 Ctrl+Tab / Shift+Tab 等系统组合键也会被误判成“减少倍速”，
+     * 且脚本会 preventDefault 掉浏览器原生的“切换标签页”行为。
+     * 因此这里要求：额外修饰键必须能归属到“当前正处于长按状态的另一侧增减快捷键”中，
+     * 除此之外一律拒绝。
      *
      * @param {KeyboardEvent} event
      * @param {string} configuredShortcut
@@ -2259,8 +2391,26 @@
             currentModifiers.add('meta');
         }
 
+        // 配置要求的修饰键必须全部按下。
         for (const modifier of requiredModifiers) {
             if (!currentModifiers.has(modifier)) {
+                return false;
+            }
+        }
+
+        // 事件里比配置多出的修饰键：只有能归属到“当前长按中的另一侧增减快捷键”时才放行。
+        // 归属检查用 `xxx+` 前缀匹配，避免 `ctrl+shift+tab` 里的 shift 被误归到 `shift+tab` 这类快捷键上。
+        // 其余情况（如配置裸键 Tab 时按下 Ctrl+Tab）一律拒绝，
+        // 让浏览器继续处理原生组合键行为。
+        if (currentModifiers.size > requiredModifiers.size) {
+            const extraModifiers = [...currentModifiers].filter(
+                (modifier) => !requiredModifiers.has(modifier)
+            );
+            const activeHoldShortcut = state.rateAdjustHoldShortcut || '';
+            const canAttachToActiveHold = extraModifiers.every(
+                (modifier) => activeHoldShortcut.includes(`${modifier}+`)
+            );
+            if (!canAttachToActiveHold) {
                 return false;
             }
         }
@@ -2888,7 +3038,10 @@
      */
     function installShortcutListener() {
         const handleKeydown = (event) => {
-            if (event.defaultPrevented || event.isComposing) {
+            // 守卫兼容：网页键盘IME守卫脚本会抢先 preventDefault 裸字母键阻止 IME 组词，
+            // 此时 defaultPrevented 为 true 但事件仍应继续处理（守卫不打 stopPropagation）。
+            // 只有"被其他业务/页面监听器处理过"的按键（defaultPrevented 且非守卫标记）才跳过。
+            if (event.isComposing || (event.defaultPrevented && !event.__imeGuardHandled)) {
                 return;
             }
 
@@ -3108,6 +3261,8 @@
      * B 站是 SPA，很多时候 URL 变了但页面没有整刷，所以这里要主动刷新当前视频键和历史倍速.
      */
     function refreshVideoContext() {
+        // 记录跳转前的键，用于判断是否发生了“跨合集/跨视频”切换
+        const previousVideoKey = state.currentVideoKey;
         const nextVideoKey = buildCurrentVideoKey();
         const nextVideoContextId = buildCurrentVideoContextId();
         if (
@@ -3132,6 +3287,38 @@
             videoContextId: '',
             videoElement: null
         };
+
+        /**
+         * 跨合集/跨视频跳转后的“残留倍速”清理。
+         *
+         * 背景：
+         * B 站 SPA 站内跳转时复用同一个 `<video>` 元素、只换媒体源，
+         * 并且不会重置 `playbackRate`。因此从合集A（倍速 2x）跳到合集B时，
+         * 旧视频的 2x 会残留在复用的 video 元素上，表现为“新合集前 1~2 个
+         * 视频也继承了旧合集的倍速”。
+         *
+         * 此时如果合集B没有任何历史倍速记录，`restoreSavedRateIfNeeded`
+         * 按“没有记录就不主动改动倍速”的设计会直接返回，残留的 2x 就会
+         * 一直留在播放器上。这里在“上下文键发生变化（确实是跨合集/跨视频）”
+         * 且“新键无历史倍速”时，主动把当前 video 重置为默认 1x，消除残留。
+         *
+         * 注意：
+         * - 合集内部切换视频时键不变（同一合集共享同一键），不会走到这里，
+         *   因此合集内的倍速继承完全不受影响。
+         * - 重置为 1x 时 `waitingForInitialRestore` 仍为 true，
+         *   `handleRateChange` 会忽略这次 ratechange，不会把 1x 写回记录。
+         */
+        if (previousVideoKey !== nextVideoKey && state.lastSavedRate === null) {
+            const video = findVideoElement();
+            if (
+                video instanceof HTMLVideoElement
+                && normalizeRate(video.playbackRate) !== DEFAULT_PLAYBACK_RATE
+            ) {
+                applyPlaybackRateWithRetry(video, DEFAULT_PLAYBACK_RATE);
+                console.log('[B站倍速助手] 新上下文没有历史倍速，已把残留倍速重置为 1x');
+            }
+        }
+
         const isCollectionContext = nextVideoKey.includes(':collection:');
 
         if (state.lastSavedRate === null) {
@@ -3162,6 +3349,18 @@
                 state.hrefWatchLastObserved = currentHref;
                 state.hrefWatchIdleTicks = 0;
                 refreshVideoContext();
+                /**
+                 * 合集场景的额外兜底：
+                 * 从一个合集切到另一个合集时，URL 先变、新合集列表后渲染。
+                 * 上面这次 refresh 在 120ms 附近执行，很可能还读着旧合集 DOM，
+                 * 算出的仍是旧合集的键。这里等 DOM 基本稳定后再补一次刷新，
+                 * 确保新合集拿到属于自己的键（sid 指纹），不会串用旧合集的倍速。
+                 */
+                window.setTimeout(() => {
+                    if (location.href === state.hrefWatchLastObserved) {
+                        refreshVideoContext();
+                    }
+                }, 800);
                 scheduleHrefWatch(HREF_WATCH_ACTIVE_DELAY);
                 return;
             }
@@ -3300,6 +3499,9 @@
      *    捕获视频层/控制栏整体挂载、播放器整体重建这类“大结构变化”。
      *    弹幕层、字幕层、控制栏内部的重绘都发生在容器深层，不会产生任何 mutation。
      * 3. 倍速按钮内部 subtree：捕获倍速菜单挂载/移除（菜单是按钮的后代）。
+     * 4. 合集列表根节点 subtree：SPA 站内跳转切换合集时，合集列表会被整体重绘，
+     *    观察它能在“合集指纹（sid）已经变化但 URL 没变/URL 变了但 DOM 还没就绪”
+     *    的场景下，及时触发一次上下文刷新，重新计算合集键，避免两个不同合集串倍速。
      *
      * 这样观察器平时几乎不触发，弹幕/字幕/控制栏的高频增删完全不经过观察器，
      * 长视频播放期间的主线程持续占用被彻底移除。
@@ -3317,14 +3519,17 @@
 
         const playerContainer = queryFirst(SELECTORS.playerContainer);
         const rateButton = queryFirst(SELECTORS.rateButton);
+        const collectionRoot = findUgcCollectionRoot();
         const scopeKey = [
             playerContainer ? 'player' : 'body',
-            rateButton ? 'rateButton' : 'none'
+            rateButton ? 'rateButton' : 'none',
+            collectionRoot ? 'collection' : 'noCollection'
         ].join(':');
         if (state.observedPlayerScope === scopeKey) {
             return false;
         }
         state.observedPlayerScope = scopeKey;
+        state.observedCollectionRoot = collectionRoot || null;
 
         observer.disconnect();
 
@@ -3343,8 +3548,51 @@
             observer.observe(rateButton, { childList: true, subtree: true });
         }
 
+        // 4. 合集列表根节点：递归观察，捕获“合集列表整体重绘”这一结构变化。
+        //    切换合集时新列表的数据/结构会在短时间内陆续写入，递归观察能保证
+        //    无论是外层容器重建还是内部列表项替换，都能触发一次上下文刷新。
+        if (collectionRoot) {
+            observer.observe(collectionRoot, { childList: true, subtree: true });
+        }
+
         // 观察范围发生了切换，调用方需要据此决定是否立即重新 bootstrap。
         return true;
+    }
+
+    /**
+     * 判断一次 DOM 变化是否属于“合集列表的结构性变化”。
+     *
+     * 背景：
+     * SPA 站内跳转从一个合集切到另一个合集时，URL 先变、新合集列表后渲染。
+     * 如果只靠 URL 变化触发 `refreshVideoContext`，120ms 时读到的还是旧合集
+     * 列表，算出的合集键（sid 指纹）还是旧合集的；之后若无其他事件触发刷新，
+     * 就会一直沿用旧键，导致“两个不同合集也互相继承倍速”。
+     *
+     * 这里把“合集列表项被增删 / 合集根节点被整体增删”视为合集上下文可能已
+     * 变化的信号（切换合集必然导致列表项集合整体替换）。列表项内部的高频
+     * 动态内容（如播放进度）不在此列，避免不必要的刷新。
+     *
+     * @param {MutationRecord} mutation
+     * @returns {boolean}
+     */
+    function isCollectionListRelatedMutation(mutation) {
+        const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+
+        // 列表项本身被增删（data-key 的列表项是合集/分P列表的最小单元）
+        const itemChanged = changedNodes.some((node) => (
+            node instanceof Element
+            && SELECTORS.collectionItem.some((selector) => node.matches(selector))
+        ));
+        if (itemChanged) {
+            return true;
+        }
+
+        // 合集根节点（.video-pod 等）被整体增删：容器级替换
+        const rootChanged = changedNodes.some((node) => (
+            node instanceof Element
+            && node.matches(SELECTORS.collectionRoot.join(', '))
+        ));
+        return rootChanged;
     }
 
     /**
@@ -3352,6 +3600,7 @@
      * 观察范围由 syncDomObservationScope 收窄到“结构级变化”：
      * - 播放器容器的直接子节点增删（视频层/控制栏挂载、播放器重建）
      * - 倍速按钮内部增删（倍速菜单挂载/移除）
+     * - 合集列表项/合集根节点增删（切换合集）
      * 弹幕、字幕、控制栏内部重绘等高频波动完全不经过观察器，
      * 实际处理统一交给去抖后的 bootstrap.
      */
@@ -3363,10 +3612,15 @@
             // 旧观察范围之外，就会被漏掉而一直停留在原生菜单状态。
             const scopeChanged = syncDomObservationScope();
 
+            // 合集列表结构变化（切换合集/合集列表重绘）→ 需要重新计算合集键，
+            // 否则新合集会沿用旧合集的键，导致不同合集之间互相继承倍速。
+            const collectionChanged = mutations.some((mutation) => isCollectionListRelatedMutation(mutation));
+
             // 只对与倍速 UI 相关的结构性节点变化重新 bootstrap；
             // 到这里的 mutation 只会是“播放器容器/视频层/控制栏整体挂载”或“倍速菜单挂载/移除”
             if (
                 !scopeChanged
+                && !collectionChanged
                 && !mutations.some((mutation) => isRateUiRelatedMutation(mutation))
             ) {
                 return;
